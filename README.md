@@ -5,6 +5,8 @@
 pip install benchmarks/CLIP_benchmark
 ```
 
+> **From-scratch setup guide**: See [GETTING_STARTED.md](GETTING_STARTED.md) for a detailed walkthrough that covers environment preparation, trigger matrix training, and evaluation.
+
 ### Sample running code for zero-shot evaluation with MFL-Owner:
 ```bash
 # zero-shot retrieval 
