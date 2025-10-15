@@ -1,133 +1,178 @@
-from trigger import category_freq, load_trigger_images
-from embedding import get_emb
+"""Train the watermark trigger alignment matrices for each client."""
+from __future__ import annotations
+
+import math
+from pathlib import Path
+from typing import Iterable, Tuple
+
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-import os
+from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset
+
+from embedding import EmbeddingLoadError, get_emb
 from options import get_parser_args
-from sklearn.decomposition import PCA
 
 
-def cal_sim(vector_0, vector_1):
-    
-    '''
-    Calculate the cos sim and pairwise distance
-    :param vector_0:
-    :param vector_1:
-    :return: cos_sim, pair_dis
-    '''
-    cos_sim_f = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
+def _select_device(preference: str) -> torch.device:
+    if preference == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(preference)
 
-    pair_dis_f = torch.nn.PairwiseDistance(p=2)
-    cos_sim = cos_sim_f(vector_0, vector_1)
-    pair_dis = pair_dis_f(vector_0, vector_1)
-    return cos_sim, pair_dis
-if __name__== "__main__" :
-    
-    
-    parser = get_parser_args()
-    file_path = '/root/trigger'
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Define the dimension of the embeddings
-    d = 768  # as specified in the request
-    client_num = 5
-    W = []
-    num = parser['trigger_num']
-    # Define the hyperparameter beta
-    beta = 0.05
 
-    # Assuming Y and T are your image and text embedding sets respectively
-    # Y and T should be tensors of shape [batch_size, d, m]
-    Y, T =  get_emb(client_num,f'/root/autodl-tmp/trigger-images-wo-noise-{num}')
-    method = parser['method']
+def _default_batch_size(count: int) -> int:
+    return min(64, count) if count > 0 else 1
 
-    for i in range(client_num):
-        print(f'client {i}')
-        Trigger_mat_pth = os.path.join(file_path, f"/root/trigger/results/w_matrix/noisy_w/trigger_mat_c{i}_{num}_{method}.pth" )
-        if os.path.exists(Trigger_mat_pth):
-            W_align = torch.load(Trigger_mat_pth)
-            W_align = W_align.to(device)
-            print("Loaded Trigger matrix from", Trigger_mat_pth)
+
+def _cosine_and_l2(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    cosine = F.cosine_similarity(a, b, dim=1, eps=1e-6)
+    l2 = F.pairwise_distance(a, b, p=2)
+    return cosine, l2
+
+
+def _train_single_client(
+    images: torch.Tensor,
+    texts: torch.Tensor,
+    *,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    beta: float,
+    method: str,
+    batch_size: int,
+) -> torch.Tensor:
+    dataset = TensorDataset(images.cpu(), texts.cpu())
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    dim = images.shape[1]
+    matrix = nn.Parameter(torch.empty(dim, dim, device=device))
+    nn.init.orthogonal_(matrix)
+
+    optimiser = optim.Adam([matrix], lr=lr, eps=1e-5)
+
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for image_batch, text_batch in loader:
+            image_batch = image_batch.to(device)
+            text_batch = text_batch.to(device)
+
+            optimiser.zero_grad(set_to_none=True)
+            diff = image_batch @ matrix.t() - text_batch @ matrix.t()
+            loss = torch.norm(diff, p="fro") / math.sqrt(image_batch.shape[0])
+            loss.backward()
+
+            torch.nn.utils.clip_grad_value_(matrix, clip_value=0.5)
+            optimiser.step()
+
+            if method != "random":
+                with torch.no_grad():
+                    matrix -= beta * (matrix @ matrix.t() @ matrix - matrix)
+            epoch_loss += loss.item()
+
+        if epoch % 10 == 0 or epoch == epochs - 1:
+            avg_loss = epoch_loss / max(1, len(loader))
+            print(f"Epoch {epoch:04d}: loss={avg_loss:.6f}")
+
+    return matrix.detach().cpu()
+
+
+def _print_verification(matrix: torch.Tensor, images: torch.Tensor, texts: torch.Tensor) -> None:
+    with torch.no_grad():
+        images = images.to(matrix.device)
+        texts = texts.to(matrix.device)
+        projected_images = images @ matrix.t()
+        projected_texts = texts @ matrix.t()
+
+        images_norm = F.normalize(projected_images, dim=-1)
+        texts_norm = F.normalize(projected_texts, dim=-1)
+
+        origin_cos, origin_l2 = _cosine_and_l2(images, texts)
+        trigger_cos, trigger_l2 = _cosine_and_l2(images_norm, texts_norm)
+
+        print(f"Origin:     cos={origin_cos.mean():.6f}, l2={origin_l2.mean():.6f}")
+        print(f"Watermark:  cos={trigger_cos.mean():.6f}, l2={trigger_l2.mean():.6f}")
+        print(f"Delta cos:  {trigger_cos.mean() - origin_cos.mean():.6f}")
+        print(f"Delta l2:   {origin_l2.mean() - trigger_l2.mean():.6f}")
+
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    args = get_parser_args(argv)
+
+    device = _select_device(str(args["device"]))
+    print(f"Using device: {device}")
+
+    data_root = args.get("data_root")
+    if not data_root:
+        raise SystemExit(
+            "[ERROR] --data_root is required. Provide it via the command line or set TRIGGER_DATA_ROOT."
+        )
+
+    client_ids = args["client_list"]
+    trigger_num = int(args["trigger_num"])
+    method = str(args["method"])
+    epochs = int(args["epochs"])
+    lr = float(args["lr"])
+    beta = float(args["beta"])
+
+    batch_size_arg = args.get("batch_size")
+
+    try:
+        image_embeds, text_embeds = get_emb(
+            len(client_ids),
+            data_root,
+            client_list=client_ids,
+            image_key=str(args["image_key"]),
+            text_key=str(args["text_key"]),
+        )
+    except EmbeddingLoadError as exc:
+        raise SystemExit(f"[ERROR] {exc}") from exc
+
+    output_root = Path(str(args["output_dir"]))
+    method_dir_name = method if method.endswith("_w") else f"{method}_w"
+    save_dir = output_root.expanduser() / method_dir_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    for local_idx, client_id in enumerate(client_ids):
+        images = image_embeds[local_idx].float()
+        texts = text_embeds[local_idx].float()
+
+        if images.shape != texts.shape:
+            raise SystemExit(
+                f"[ERROR] Client {client_id} has mismatched embeddings: {tuple(images.shape)} vs {tuple(texts.shape)}"
+            )
+
+        dim = images.shape[1]
+        inferred_trigger_num = images.shape[0]
+        if inferred_trigger_num != trigger_num:
+            print(
+                f"[WARN] Trigger count mismatch for client {client_id}:"
+                f" expected {trigger_num}, found {inferred_trigger_num}."
+            )
+
+        matrix_path = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
+        if matrix_path.exists():
+            print(f"==> Client {client_id}: reusing existing matrix at {matrix_path}")
+            matrix = torch.load(matrix_path, map_location=device)
         else:
-            
-            dataset = TensorDataset(Y[i], T[i])
-            if num > 64:
-                batch_size =64
-            else:
-                batch_size = num
-            data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-            # Randomly initialize the linear transformation matrix W_align
-            W_align = torch.randn(d, d, requires_grad=True, device=device)
-            torch.nn.init.orthogonal_(W_align)
-        
-            # Define the optimizer
-            optimizer = optim.Adam([W_align], lr=1e-3, eps=1e-5)
+            print(f"==> Client {client_id}: training alignment matrix (dim={dim})")
+            batch_size = batch_size_arg or _default_batch_size(inferred_trigger_num)
+            matrix = _train_single_client(
+                images,
+                texts,
+                device=device,
+                epochs=epochs,
+                lr=lr,
+                beta=beta,
+                method=method,
+                batch_size=batch_size,
+            )
+            torch.save(matrix.cpu(), matrix_path)
+            print(f"Saved matrix to {matrix_path}")
 
-            # Training loop
-            num_epochs = 1000 # Set number of epochs as needed
-            for epoch in range(num_epochs):
-                for batch_image_embeddings, batch_text_embeddings in data_loader:
-                    optimizer.zero_grad()
-    
-                    # Calculate the loss function as ||W_align * Y - W_align.T * T||_F
-                    loss = torch.norm(W_align @ batch_image_embeddings.T - W_align @ batch_text_embeddings.T, p='fro')
-    
-                    # Backpropagate the loss
-                    loss.backward()
-    
-                   
-                    # torch.nn.utils.clip_grad_norm_(W_align, max_norm=0.5)
-                    torch.nn.utils.clip_grad_value_(W_align, clip_value=0.5)
-                    optimizer.step()
-                     
-                    if parser['method'] != 'random':
-                    # Manually update W_align with the orthogonal constraint
-                        with torch.no_grad():
-                            W_align -= beta * (W_align @ W_align.T @ W_align - W_align)
+        _print_verification(matrix.to(device), images.to(device), texts.to(device))
 
-                if epoch % 10 == 0:  # Print loss every 10 epochs
-                    print(f'Epoch {epoch}, Loss: {loss.item()}')
-                
-            torch.save(W_align, f'/root/trigger/results/w_matrix/noisy_w/trigger_mat_c{i}_{num}_{method}.pth')
-            W.append(W_align)
-            print("Training complete.")
-        
-        # watermark verification
-        origin_image_features = Y[i]
-        origin_text_features = T[i]
-        
-        # watermark
-        image_features = origin_image_features @ W_align.T
-        text_features = origin_text_features @ W_align.T
 
-        images_emb = image_features / image_features.norm(dim=-1, keepdim = True)
-        texts_emb = text_features / text_features.norm(dim=-1, keepdim = True) 
-  
-        if origin_image_features.shape[0] == origin_text_features.shape[0]:
-            
-            origin_cos_sim, origin_pair_dis = cal_sim(origin_image_features, origin_text_features)
-            
-            Trigger_cos_sim, Trigger_pair_dis = cal_sim(images_emb, texts_emb)
-            print(origin_pair_dis)
-            
-            
-            
-            print("Origin: cos similarity: %lf, pair distance: %lf" % (float(origin_cos_sim.mean()), float(origin_pair_dis.mean())))
-            print("Trigger_mat: cos similarity: %lf, pair distance: %lf" % (float(Trigger_cos_sim.mean()), float(Trigger_pair_dis.mean())))
-            
-            
-            
-            print('delta cos similarity: %lf' % ((float(Trigger_cos_sim.mean())-float(origin_cos_sim.mean()))))
-            print('delta pair distance: %lf' % (-float(Trigger_pair_dis.mean())+float(origin_pair_dis.mean())))
-            
-            m_cos = (((float(Trigger_cos_sim.mean())-float(origin_cos_sim.mean())))+2)/4
-            m_l2 = ((-float(Trigger_pair_dis.mean())+float(origin_pair_dis.mean()))+2)/4
-            
-            print('delta total:', 0.5*m_cos+0.5*m_l2)
-            
-           
-            
-
+if __name__ == "__main__":
+    main()
 
