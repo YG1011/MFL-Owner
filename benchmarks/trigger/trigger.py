@@ -10,6 +10,7 @@ from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 # -----------------------------
@@ -111,26 +112,113 @@ def load_matrix(path: str | Path, map_location: str | torch.device = "cpu") -> t
 
 @torch.no_grad()
 def procrustes_rotation(E_new: torch.Tensor, E_old: torch.Tensor) -> torch.Tensor:
-    """
-    求解 R* = argmin_{R∈O(d)} || E_new R - E_old ||_F
-    按幻灯片：设 C = E_new^T E_old = U Σ V^T，则 R* = U V^T
-    形状：
-      - E_new: [N, d]
-      - E_old: [N, d]
-    返回：
-      - R*: [d, d] 正交矩阵
-    """
-    assert E_new.ndim == 2 and E_old.ndim == 2 and E_new.shape == E_old.shape
+    """Compute the Procrustes rotation aligning ``E_new`` to ``E_old``."""
+
+    if E_new.ndim != 2 or E_old.ndim != 2 or E_new.shape != E_old.shape:
+        raise ValueError(
+            "E_new and E_old must be two 2-D tensors with identical shapes for Procrustes alignment"
+        )
+
     C = E_new.T @ E_old  # [d, d]
     U, _, Vh = torch.linalg.svd(C, full_matrices=False)
     R = U @ Vh
-    # 数值稳定：强制到最近的正交阵
-    # (可选) det<0 纠正反射：R[:, -1] *= torch.sign(torch.det(R))
+
+    # Numerical safeguard: eliminate potential reflections so that det(R) ≈ 1
+    det = torch.det(R)
+    if det < 0:
+        U = U.clone()
+        U[:, -1] *= -1
+        R = U @ Vh
+
     return R
 
-def apply_rotation(W: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-    """返回 W_new = R @ W"""
-    return (R @ W).to(W.dtype)
+
+@torch.no_grad()
+def dynamic_watermark_update(W_old: torch.Tensor, R: torch.Tensor, beta: float) -> torch.Tensor:
+    """Adaptive update ``W_old`` using rotation ``R`` and orthogonal relaxation ``beta``."""
+
+    W_rot = (R @ W_old).to(dtype=W_old.dtype)
+    if beta <= 0:
+        return W_rot
+
+    gram = W_rot @ W_rot.T
+    return (1.0 + beta) * W_rot - beta * gram @ W_rot
+
+
+@torch.no_grad()
+def time_consistency_update(
+    W_candidate: torch.Tensor,
+    *,
+    W_prev: torch.Tensor,
+    R: torch.Tensor,
+    lambda_: float = 0.0,
+    mu: float = 0.0,
+) -> torch.Tensor:
+    """Apply optional time-consistency smoothing (Eq. 7 in the spec)."""
+
+    if lambda_ > 0:
+        target = (R @ W_prev).to(W_candidate.dtype)
+        W_candidate = (1.0 - lambda_) * W_candidate + lambda_ * target
+
+    if mu > 0:
+        W_candidate = (1.0 - mu) * W_candidate + mu * W_prev.to(W_candidate.dtype)
+
+    return W_candidate
+
+
+@torch.no_grad()
+def apply_whitebox_penalty(
+    W: torch.Tensor,
+    U: torch.Tensor,
+    V: torch.Tensor,
+    Mi: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    """Single proximal step towards the fingerprint target ``Mi``."""
+
+    if gamma <= 0:
+        return W
+
+    diff = U.T @ W @ V - Mi
+    grad = U @ diff @ V.T
+    return (W - 2.0 * gamma * grad).to(W.dtype)
+
+
+@torch.no_grad()
+def encode_targets(embeddings: torch.Tensor, W: torch.Tensor, *, normalise: bool = True) -> torch.Tensor:
+    """Project trigger embeddings through ``W`` to generate dynamic targets."""
+
+    encoded = embeddings @ W.T
+    if normalise:
+        encoded = F.normalize(encoded, dim=-1, eps=1e-6)
+    return encoded
+
+
+@torch.no_grad()
+def blackbox_statistics(
+    embeddings_a: torch.Tensor,
+    embeddings_b: torch.Tensor,
+    *,
+    matrix: torch.Tensor | None = None,
+) -> dict:
+    """Compute cosine/L2 statistics before and after watermarking."""
+
+    if matrix is not None:
+        embeddings_a = embeddings_a @ matrix.T
+        embeddings_b = embeddings_b @ matrix.T
+
+    norm_a = F.normalize(embeddings_a, dim=-1, eps=1e-6)
+    norm_b = F.normalize(embeddings_b, dim=-1, eps=1e-6)
+
+    cos = F.cosine_similarity(norm_a, norm_b, dim=-1, eps=1e-6)
+    l2 = F.pairwise_distance(norm_a, norm_b, p=2)
+
+    return {
+        "cos_mean": cos.mean().item(),
+        "cos_std": cos.std(unbiased=False).item(),
+        "l2_mean": l2.mean().item(),
+        "l2_std": l2.std(unbiased=False).item(),
+    }
 
 # -----------------------------
 # 4) 白盒指标/基/水印加载
@@ -187,11 +275,21 @@ def whitebox_distance(W_enc: torch.Tensor, U: torch.Tensor, V: torch.Tensor, Mi:
 
 __all__ = [
     # 原有
-    "category_freq", "load_trigger_images",
+    "category_freq",
+    "load_trigger_images",
     # I/O
-    "ensure_dir", "save_matrix", "load_matrix",
+    "ensure_dir",
+    "save_matrix",
+    "load_matrix",
     # 动态水印
-    "procrustes_rotation", "apply_rotation",
+    "procrustes_rotation",
+    "dynamic_watermark_update",
+    "time_consistency_update",
+    "apply_whitebox_penalty",
+    "encode_targets",
+    "blackbox_statistics",
     # 白盒
-    "load_basis", "load_Mi", "whitebox_distance",
+    "load_basis",
+    "load_Mi",
+    "whitebox_distance",
 ]
