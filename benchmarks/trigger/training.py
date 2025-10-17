@@ -16,8 +16,15 @@ from options import get_parser_args
 
 # 你方法用到的工具（按你现有 trigger.py 提供）
 from trigger import (
-    procrustes_rotation, apply_rotation,
-    load_basis, load_Mi, whitebox_distance,
+    procrustes_rotation,
+    dynamic_watermark_update,
+    time_consistency_update,
+    apply_whitebox_penalty,
+    encode_targets,
+    blackbox_statistics,
+    load_basis,
+    load_Mi,
+    whitebox_distance,
 )
 
 # -----------------------------
@@ -51,6 +58,7 @@ def _train_single_client(
     beta: float,
     method: str,
     batch_size: int,
+    whitebox: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None,
 ) -> torch.Tensor:
     dataset = TensorDataset(images.cpu(), texts.cpu())
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -71,6 +79,13 @@ def _train_single_client(
             # || W X - W T ||_F
             diff = image_batch @ matrix.t() - text_batch @ matrix.t()
             loss = torch.norm(diff, p="fro") / math.sqrt(image_batch.shape[0])
+
+            if whitebox is not None:
+                U, V, Mi, gamma = whitebox
+                if Mi is not None and gamma > 0:
+                    proj = U.t() @ matrix @ V - Mi
+                    loss = loss + gamma * torch.norm(proj, p="fro") ** 2
+
             loss.backward()
 
             torch.nn.utils.clip_grad_value_(matrix, clip_value=0.5)
@@ -160,7 +175,12 @@ def main(argv: Iterable[str] | None = None) -> None:
     epochs         = int(args["epochs"])
     lr             = float(args["lr"])
     beta           = float(args["beta"])
+    time_lambda    = float(args.get("time_lambda", 0.0))
+    time_mu        = float(args.get("time_mu", 0.0))
     batch_size_arg = args.get("batch_size")
+    whitebox_gamma = float(args.get("whitebox_gamma", 0.0))
+    save_targets   = bool(args.get("save_targets"))
+    target_dir_opt = args.get("target_dir")
 
     # 动态 / 静态 模式判定
     dynamic_mode = bool(prev_root and new_root)
@@ -201,11 +221,22 @@ def main(argv: Iterable[str] | None = None) -> None:
     save_dir = output_root.expanduser() / method_dir_name
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    target_dir = None
+    if save_targets:
+        if target_dir_opt:
+            target_dir = Path(str(target_dir_opt)).expanduser()
+        else:
+            target_dir = save_dir / "targets"
+        target_dir.mkdir(parents=True, exist_ok=True)
+
     # 白盒指标准备
     wb_report = bool(args.get("wb_report"))
     U_cache = V_cache = None
 
     for local_idx, client_id in enumerate(client_ids):
+        Mi: torch.Tensor | None = None
+        whitebox_payload: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None
+
         if dynamic_mode:
             # 用“图像端”的两轮嵌入
             E_old = img_prev[local_idx].float().to(device)  # t
@@ -223,6 +254,17 @@ def main(argv: Iterable[str] | None = None) -> None:
                 print(f"[WARN] Client {client_id}: trigger count mismatch: "
                       f"expected {trigger_num}, found {inferred_trigger_num}.")
 
+            if whitebox_gamma > 0 or wb_report:
+                if U_cache is None or U_cache.shape[0] != dim:
+                    U_cache = load_basis(args.get("wb_U"), dim, device)
+                if V_cache is None or V_cache.shape[0] != dim:
+                    V_cache = load_basis(args.get("wb_V"), dim, device)
+                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device)
+                if whitebox_gamma > 0 and Mi is None:
+                    print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
+                elif whitebox_gamma > 0 and Mi is not None:
+                    whitebox_payload = (U_cache, V_cache, Mi, whitebox_gamma)
+
             # 读取上一轮 W，或从 I 开始
             matrix_path = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
             if matrix_path.exists() and args.get("init_from_existing"):
@@ -234,11 +276,18 @@ def main(argv: Iterable[str] | None = None) -> None:
 
             # Procrustes：R* 使得 E_new R ≈ E_old
             R_star = procrustes_rotation(E_new, E_old)
-            W_new = apply_rotation(W_old, R_star).to(device)
+            W_new = dynamic_watermark_update(W_old, R_star, beta)
+            W_new = time_consistency_update(
+                W_new,
+                W_prev=W_old,
+                R=R_star,
+                lambda_=time_lambda,
+                mu=time_mu,
+            )
 
-            # 可选：一次正交回拉，数值更稳
-            with torch.no_grad():
-                W_new -= beta * (W_new @ W_new.t() @ W_new - W_new)
+            if whitebox_payload is not None:
+                U_dyn, V_dyn, Mi_dyn, gamma_dyn = whitebox_payload
+                W_new = apply_whitebox_penalty(W_new, U_dyn, V_dyn, Mi_dyn, gamma_dyn)
 
             torch.save(W_new.detach().cpu(), matrix_path)
             print(f"[Dynamic] Client {client_id}: saved updated matrix to {matrix_path}")
@@ -248,6 +297,18 @@ def main(argv: Iterable[str] | None = None) -> None:
                   f"equal(E_new,E_old)? {torch.allclose(E_new, E_old)} "
                   f"max|diff|={(E_new - E_old).abs().max().item():.6f}")
             _print_dynamic_verification(W_new, W_old, E_new, E_old)
+
+            before_stats = blackbox_statistics(E_new, E_old)
+            after_stats = blackbox_statistics(E_new @ W_new.t(), E_old @ W_old.t())
+            print(
+                f"[Dynamic-BlackBox] client {client_id}: "
+                f"before cos={before_stats['cos_mean']:.6f}±{before_stats['cos_std']:.6f}, "
+                f"after cos={after_stats['cos_mean']:.6f}±{after_stats['cos_std']:.6f}"
+            )
+
+            if save_targets and target_dir is not None:
+                encoded = encode_targets(E_new, W_new)
+                torch.save(encoded.cpu(), target_dir / f"B_client{client_id}.pt")
 
             matrix = W_new  # 供白盒指标用
 
@@ -268,6 +329,17 @@ def main(argv: Iterable[str] | None = None) -> None:
                 print(f"[WARN] Trigger count mismatch for client {client_id}: "
                       f"expected {trigger_num}, found {inferred_trigger_num}.")
 
+            if whitebox_gamma > 0 or wb_report:
+                if U_cache is None or U_cache.shape[0] != dim:
+                    U_cache = load_basis(args.get("wb_U"), dim, device)
+                if V_cache is None or V_cache.shape[0] != dim:
+                    V_cache = load_basis(args.get("wb_V"), dim, device)
+                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device)
+                if whitebox_gamma > 0 and Mi is None:
+                    print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
+                elif whitebox_gamma > 0 and Mi is not None:
+                    whitebox_payload = (U_cache, V_cache, Mi, whitebox_gamma)
+
             matrix_path = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
             if matrix_path.exists():
                 print(f"==> Client {client_id}: reusing existing matrix at {matrix_path}")
@@ -286,25 +358,40 @@ def main(argv: Iterable[str] | None = None) -> None:
                     images, texts,
                     device=device, epochs=epochs, lr=lr, beta=beta,
                     method=method, batch_size=batch_size,
+                    whitebox=whitebox_payload,
                 )
                 torch.save(matrix.cpu(), matrix_path)
                 print(f"Saved matrix to {matrix_path}")
 
-            _print_verification(matrix.to(device), images.to(device), texts.to(device))
+            matrix_device = matrix.to(device)
+            _print_verification(matrix_device, images.to(device), texts.to(device))
+
+            stats = blackbox_statistics(images.to(device), texts.to(device), matrix=matrix_device)
+            print(
+                f"[BlackBox] client {client_id}: "
+                f"cos={stats['cos_mean']:.6f}±{stats['cos_std']:.6f}, "
+                f"l2={stats['l2_mean']:.6f}±{stats['l2_std']:.6f}"
+            )
+
+            if save_targets and target_dir is not None:
+                encoded = encode_targets(images.to(device), matrix_device)
+                torch.save(encoded.cpu(), target_dir / f"B_client{client_id}.pt")
+
+            matrix = matrix_device
 
         # -----------------------------
         # 白盒指标（可选）
         # -----------------------------
         if wb_report:
             dim_w = matrix.shape[0]
-            if U_cache is None:
+            if U_cache is None or U_cache.shape[0] != dim_w:
                 U_cache = load_basis(args.get("wb_U"), dim_w, device)
-            if V_cache is None:
+            if V_cache is None or V_cache.shape[0] != dim_w:
                 V_cache = load_basis(args.get("wb_V"), dim_w, device)
 
-            Mi = load_Mi(args.get("wb_M_dir"), client_id, dim_w, device)
-            if Mi is not None:
-                d_wb = whitebox_distance(matrix.to(device), U_cache, V_cache, Mi)
+            Mi_report = Mi if Mi is not None else load_Mi(args.get("wb_M_dir"), client_id, dim_w, device)
+            if Mi_report is not None:
+                d_wb = whitebox_distance(matrix.to(device), U_cache, V_cache, Mi_report)
                 print(f"[WhiteBox] client {client_id}: D_wb = {d_wb:.6f}")
             else:
                 print(f"[WhiteBox] client {client_id}: Mi not provided, skip.")
