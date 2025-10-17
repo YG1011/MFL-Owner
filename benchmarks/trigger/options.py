@@ -75,6 +75,12 @@ def get_parser_args(argv: Optional[Iterable[str]] = None) -> Dict[str, object]:
     parser.add_argument("--beta", type=float,
                         default=_env_float("TRIGGER_BETA", 0.05),
                         help="Step size of orthogonal regularization (default: 0.05).")
+    parser.add_argument("--time_lambda", type=float,
+                        default=_env_float("TRIGGER_TIME_LAMBDA", 0.0),
+                        help="Time-consistency blending factor λ in dynamic mode (Eq. 7).")
+    parser.add_argument("--time_mu", type=float,
+                        default=_env_float("TRIGGER_TIME_MU", 0.0),
+                        help="Time-consistency smoothing factor μ towards previous Wi (Eq. 7).")
     parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int,
                         default=_env_int("TRIGGER_BATCH_SIZE", None),
                         help="Mini-batch size for training. Default: min(64, N).")
@@ -102,6 +108,16 @@ def get_parser_args(argv: Optional[Iterable[str]] = None) -> Dict[str, object]:
                         help="Directory containing Mi per client: Mi_client{c}.pt")
     parser.add_argument("--wb_report", action="store_true",
                         help="Report white-box distance D_wb(i) after training/updating.")
+    parser.add_argument("--whitebox_gamma", type=float,
+                        default=_env_float("TRIGGER_WHITEBOX_GAMMA", 0.0),
+                        help="Weight γ for white-box fingerprint regularisation (Eq. 8).")
+
+    # === 触发目标持久化 ===
+    parser.add_argument("--save_targets", action="store_true",
+                        help="Persist encoded trigger targets B_i to disk (Eq. 6).")
+    parser.add_argument("--target_dir", type=str,
+                        default=os.environ.get("TRIGGER_TARGET_DIR"),
+                        help="Output directory for saved encoded triggers B_i.")
 
 
     args = parser.parse_args(args=list(argv) if argv is not None else None)
