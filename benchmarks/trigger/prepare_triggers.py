@@ -1,128 +1,215 @@
-# prepare_triggers.py
-import os, json, random, math, re
-from pathlib import Path
+"""Prepare trigger embeddings from image datasets (Visual Genome friendly)."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
 from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence
 
 import torch
-import open_clip
 from PIL import Image
 from tqdm import tqdm
 
-# =========================
-# Configs (可按需修改)
-# =========================
-NUM_CLIENTS = 5
-TRIGGERS_PER_CLIENT = 512
-CLASSES_PER_CLIENT = 3
-NOISE_STD = 0.08   # 高斯噪声强度（0~1）
-MODEL_NAME = "ViT-L-14"
-PRETRAINED = "laion2b_s32b_b82k"
+import open_clip
 
-# 环境变量中读取路径（也可直接写死）
-VG_ROOT = Path(os.environ.get("VG_ROOT", "/home/ubuntu/641/YYG/MFL-Owner-main/benchmarks/trigger/data/visual_genome")).expanduser()
-TRIGGER_ROOT = Path(os.environ.get("TRIGGER_ROOT", "/home/ubuntu/641/YYG/MFL-Owner-main/benchmarks/trigger/data/triggers")).expanduser()
-TEXT_BASE = TRIGGER_ROOT / "texts_base.txt"
-
-# VG 图片两个目录（常见结构）
-VG_IMG_DIRS = [VG_ROOT / "VG_100K", VG_ROOT / "VG_100K_2"]
-VG_OBJECTS_JSON = VG_ROOT / "objects.json" 
+from trigger import ensure_dir
 
 
-def _list_all_images(img_dirs):
-    imgs = []
-    for d in img_dirs:
-        if d.exists():
-            for name in os.listdir(d):
-                if name.lower().endswith((".jpg", ".jpeg", ".png")):
-                    imgs.append(d / name)
-    return imgs
+# ---------------------------------------------------------------------------
+# Argument & environment helpers
+# ---------------------------------------------------------------------------
 
 
-def _index_objects(objects_json, img_dirs):
-    """
-    返回:
-      - cls_freq: Counter 类别词频
-      - cls2images: dict[str, set[Path]] 将类别映射到包含该类别的图片集合
-    """
-    # 构建 filename -> full_path 映射
-    name2path = {}
-    for p in _list_all_images(img_dirs):
-        name2path[p.name] = p
+def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+    value = os.environ.get(name)
+    return value if value is not None else default
 
-    with open(objects_json, "r") as f:
-        objects = json.load(f)
 
-    cls_freq = Counter()
-    cls2images = defaultdict(set)
+def _env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _resolve_device(pref: str) -> torch.device:
+    if pref == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(pref)
+
+
+def _build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate per-client trigger embeddings using OpenCLIP.")
+
+    parser.add_argument("--vg-root", type=str,
+                        default=_env_str("VG_ROOT"),
+                        help="Root directory of the Visual Genome dataset (for objects.json & images).")
+    parser.add_argument("--vg-image-dir", type=str, action="append", dest="vg_image_dirs",
+                        help="Additional image directories to scan (defaults to VG_ROOT/VG_100K[_2]).")
+    parser.add_argument("--objects-json", type=str,
+                        default=_env_str("VG_OBJECTS_JSON"),
+                        help="Path to objects.json file describing object annotations.")
+    parser.add_argument("--trigger-root", type=str,
+                        default=_env_str("TRIGGER_ROOT"),
+                        help="Output directory to store client trigger embeddings.")
+    parser.add_argument("--texts-base", type=str,
+                        default=_env_str("TRIGGER_TEXT_BASE"),
+                        help="Optional text corpus providing base prompts (one per line).")
+
+    parser.add_argument("--num-clients", type=int,
+                        default=_env_int("TRIGGER_CLIENT_NUM", 5),
+                        help="Number of clients to prepare.")
+    parser.add_argument("--triggers-per-client", type=int,
+                        default=_env_int("TRIGGER_NUM", 512),
+                        help="Number of trigger samples per client.")
+    parser.add_argument("--classes-per-client", type=int,
+                        default=_env_int("TRIGGER_CLASSES_PER_CLIENT", 3),
+                        help="Number of object classes assigned to each client.")
+    parser.add_argument("--noise-std", type=float,
+                        default=_env_float("TRIGGER_NOISE_STD", 0.06),
+                        help="Gaussian noise strength applied to images before encoding (0-1 range).")
+    parser.add_argument("--seed", type=int,
+                        default=_env_int("TRIGGER_SEED", 42),
+                        help="Random seed for sampling.")
+
+    parser.add_argument("--model-name", type=str,
+                        default=_env_str("TRIGGER_MODEL_NAME", "ViT-L-14"),
+                        help="OpenCLIP model name.")
+    parser.add_argument("--pretrained", type=str,
+                        default=_env_str("TRIGGER_PRETRAINED", "laion2b_s32b_b82k"),
+                        help="Name of the pretrained checkpoint to load via open_clip.")
+    parser.add_argument("--pretrained-hf", type=str,
+                        default=_env_str("TRIGGER_PRETRAINED_HF"),
+                        help="Local HuggingFace snapshot directory for the model (overrides --pretrained).")
+    parser.add_argument("--device", type=str,
+                        default=_env_str("TRIGGER_DEVICE", "auto"),
+                        help="Device to run OpenCLIP on: 'cpu', 'cuda', or 'auto'.")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
+
+
+def _list_all_images(img_dirs: Sequence[Path]) -> List[Path]:
+    supported = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    images: List[Path] = []
+    for directory in img_dirs:
+        if not directory.exists():
+            continue
+        for entry in directory.iterdir():
+            if entry.is_file() and entry.suffix.lower() in supported:
+                images.append(entry)
+    return images
+
+
+def _index_objects(objects_json: Path, img_dirs: Sequence[Path]) -> tuple[Counter, dict[str, List[Path]]]:
+    name_to_path = {path.name: path for path in _list_all_images(img_dirs)}
+    if not name_to_path:
+        raise SystemExit("[ERROR] No images found under the provided VG directories.")
+
+    with objects_json.open("r", encoding="utf-8") as handle:
+        objects = json.load(handle)
+
+    cls_freq: Counter = Counter()
+    cls2images: dict[str, set[Path]] = defaultdict(set)
 
     for entry in tqdm(objects, desc="Indexing Visual Genome objects"):
-        # entry: { "image_id":..., "objects":[{ "names":[...] }, ...], "image_url": "...", "image_filename": "2387136.jpg" }
-        # 不同版本字段名可能不同，兼容取 filename / url / id
         filename = entry.get("image_filename")
         if not filename:
-            # 有些版本无 image_filename，可尝试从 image_url 或 image_id 派生，这里做简单兼容
             url = entry.get("image_url", "")
-            m = re.search(r"/([^/]+\.jpg)$", url)
-            if m: filename = m.group(1)
+            match = re.search(r"/([^/]+\.jpg)$", url)
+            if match:
+                filename = match.group(1)
         if not filename:
-            # 放弃此条
             continue
 
-        img_path = name2path.get(filename)
-        if not img_path:
+        image_path = name_to_path.get(filename)
+        if image_path is None:
             continue
 
         for obj in entry.get("objects", []):
-            # names 里可能有多个别名，统一小写
             for name in obj.get("names", []):
                 cls = str(name).strip().lower()
-                if not cls: 
+                if not cls:
                     continue
                 cls_freq[cls] += 1
-                cls2images[cls].add(img_path)
+                cls2images[cls].add(image_path)
 
-    # 转 set -> list（后续采样要索引）
-    cls2images = {k: list(v) for k, v in cls2images.items()}
-    return cls_freq, cls2images
-
-
-def _pick_top_classes(cls_freq, total_needed):
-    # 过滤特别杂乱的无意义词：如 very 常见的 stopwords（可按需扩充）
-    blacklist = set(["the", "a", "an", "and", "of", "with", "in", "on", "to"])
-    items = [(c, n) for c, n in cls_freq.most_common() if c not in blacklist and len(c) >= 2]
-    return [c for c, _ in items[:total_needed]]
+    filtered = {cls: list(paths) for cls, paths in cls2images.items() if paths}
+    return cls_freq, filtered
 
 
-def _assign_classes_to_clients(top_classes, num_clients, per_client):
-    assert len(top_classes) >= num_clients * per_client
-    clients = []
-    k = 0
+def _pick_top_classes(cls_freq: Counter, cls2images: dict[str, List[Path]], total_needed: int) -> List[str]:
+    blacklist = {"the", "a", "an", "and", "of", "with", "in", "on", "to"}
+    choices: List[str] = []
+    for cls, _ in cls_freq.most_common():
+        if cls in blacklist:
+            continue
+        if len(cls) < 2:
+            continue
+        if cls not in cls2images:
+            continue
+        choices.append(cls)
+        if len(choices) >= total_needed:
+            break
+    if len(choices) < total_needed:
+        raise SystemExit(
+            f"[ERROR] Not enough classes with images. Needed {total_needed}, found {len(choices)}.")
+    return choices
+
+
+def _assign_classes_to_clients(top_classes: Sequence[str], num_clients: int, per_client: int) -> List[List[str]]:
+    assignments: List[List[str]] = []
+    cursor = 0
     for _ in range(num_clients):
-        clients.append(top_classes[k:k+per_client])
-        k += per_client
-    return clients
+        assignments.append(list(top_classes[cursor:cursor + per_client]))
+        cursor += per_client
+    return assignments
 
 
-def _ensure_len(x, K):
-    if len(x) >= K:
-        return random.sample(x, K)
-    # 不足就回采补齐
-    need = K - len(x)
-    return x + random.choices(x, k=need)
+def _ensure_len(values: Sequence[Path], count: int, rng: random.Random) -> List[Path]:
+    values = list(values)
+    if not values:
+        raise SystemExit("[ERROR] Attempted to sample from an empty image pool.")
+    if len(values) >= count:
+        return rng.sample(values, count)
+    result = list(values)
+    while len(result) < count:
+        result.append(rng.choice(values))
+    rng.shuffle(result)
+    return result
 
 
-def _load_texts_base(n=512):
-    if TEXT_BASE.exists():
-        lines = [ln.strip() for ln in TEXT_BASE.read_text(encoding="utf-8").splitlines() if ln.strip()]
-        if len(lines) >= n:
-            print(f"Using user-provided texts_base.txt ({len(lines)})")
-            return lines[:n]
-        print(f"[WARN] texts_base.txt only has {len(lines)} lines, will auto-complete to {n}.")
-        base = lines
-    else:
-        base = []
+def _load_texts_base(path: Optional[Path], n: int, rng: random.Random) -> List[str]:
+    base: List[str] = []
+    if path and path.exists():
+        base = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if len(base) >= n:
+            print(f"Using provided texts_base from {path} ({len(base)} entries)")
+            return base[:n]
+        print(f"[WARN] texts_base at {path} has {len(base)} entries; synthesising {n - len(base)} extras.")
 
-    # 自动补齐模板文本（与类别无关，但可加一些多样性）
     adjectives = ["small", "large", "bright", "dark", "vivid", "blurry", "noisy", "realistic", "synthetic", "minimal"]
     templates = [
         "a photo of something",
@@ -136,124 +223,170 @@ def _load_texts_base(n=512):
         "a {adj} image",
         "a {adj} picture of something",
     ]
+
     while len(base) < n:
-        adj = random.choice(adjectives)
-        t = random.choice(templates).format(adj=adj)
-        base.append(t)
+        adjective = rng.choice(adjectives)
+        template = rng.choice(templates)
+        base.append(template.format(adj=adjective))
     return base[:n]
 
 
-def _texts_for_client(base_texts):
-    """论文描述容易理解为“各客户端共用同一套 512 文本”，我们按此实现。"""
-    return list(base_texts)  # 复制一份
+def _add_gaussian_noise(tensor: torch.Tensor, std: float) -> torch.Tensor:
+    if std <= 0:
+        return tensor
+    noise = torch.randn_like(tensor)
+    # Torch's global RNG is seeded separately; ensure reproducibility by seeding beforehand.
+    return (tensor + std * noise).clamp(0.0, 1.0)
 
 
-def _add_gaussian_noise(t: torch.Tensor, std=0.05):
-    if std <= 0: return t
-    noise = torch.randn_like(t) * std
-    t = t + noise
-    return t.clamp(0, 1)
+# ---------------------------------------------------------------------------
+# Encoding pipeline
+# ---------------------------------------------------------------------------
 
 
-def prepare_triggers():
-    random.seed(42)
-
-    # ====== 1) 索引类别 & 图片 ======
-    if VG_OBJECTS_JSON.exists():
-        cls_freq, cls2images = _index_objects(VG_OBJECTS_JSON, VG_IMG_DIRS)
-        need = NUM_CLIENTS * CLASSES_PER_CLIENT
-        top_classes = _pick_top_classes(cls_freq, need)
-        client_cls = _assign_classes_to_clients(top_classes, NUM_CLIENTS, CLASSES_PER_CLIENT)
-        print("Assigned classes per client:", client_cls)
+def _load_model(model_name: str, pretrained: Optional[str], pretrained_hf: Optional[str], device: torch.device):
+    kwargs = {"device": device}
+    if pretrained_hf:
+        snapshot = Path(pretrained_hf).expanduser()
+        if not snapshot.exists():
+            raise SystemExit(f"[ERROR] HuggingFace snapshot directory not found: {snapshot}")
+        kwargs["pretrained"] = None
+        kwargs["pretrained_hf"] = str(snapshot)
     else:
-        # 没有 objects.json：fallback 为“随机图片”
-        print("[WARN] objects.json not found. Will sample random images for each client.")
-        all_imgs = _list_all_images(VG_IMG_DIRS)
-        if len(all_imgs) == 0:
-            raise SystemExit(f"No images found under {VG_IMG_DIRS}")
-        client_cls = [["randomA", "randomB", "randomC"] for _ in range(NUM_CLIENTS)]
-        cls2images = {"__all__": all_imgs}
+        kwargs["pretrained"] = pretrained
 
-    # ====== 2) 准备 OpenCLIP ======
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    MODEL_DIR = "/home/ubuntu/641/YYG/MFL-Owner-main/benchmarks/trigger/models"
-
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        MODEL_NAME,
-        pretrained=None,           # 不用在线标签
-        pretrained_hf=MODEL_DIR,   # 指向本地快照目录（含 *.safetensors / *.json）
-        device=device,
-    )
-    tokenizer = open_clip.get_tokenizer(MODEL_NAME)
+    model, _, preprocess = open_clip.create_model_and_transforms(model_name, **kwargs)
+    tokenizer = open_clip.get_tokenizer(model_name)
     model.eval()
+    return model, preprocess, tokenizer
 
 
-    # ====== 3) 基础文本（512 条） ======
-    base_texts = _load_texts_base(TRIGGERS_PER_CLIENT)
+def _encode_images(
+    image_paths: Sequence[Path],
+    *,
+    preprocess,
+    model,
+    device: torch.device,
+    noise_std: float,
+) -> torch.Tensor:
+    tensors: List[torch.Tensor] = []
+    with torch.no_grad():
+        for path in tqdm(image_paths, desc="Encoding images", leave=False):
+            with Image.open(path) as img:
+                img = img.convert("RGB")
+                tensor = preprocess(img)
+                tensor = _add_gaussian_noise(tensor, noise_std)
+                tensors.append(tensor.unsqueeze(0))
 
-    # ====== 4) 为每个客户端采样图片 & 生成文本 & 计算嵌入 ======
-    TRIGGER_ROOT.mkdir(parents=True, exist_ok=True)
+        batch = torch.cat(tensors, dim=0).to(device)
+        features = model.encode_image(batch)
+        features = features / features.norm(dim=-1, keepdim=True)
+        return features.float().cpu()
 
-    for cid in range(NUM_CLIENTS):
-        out_dir = TRIGGER_ROOT / f"client_{cid}"
-        out_dir.mkdir(parents=True, exist_ok=True)
 
-        # 选图
-        if VG_OBJECTS_JSON.exists():
-            pools = []
-            for c in client_cls[cid]:
-                pools += cls2images.get(c, [])
-            if len(pools) == 0:
-                raise SystemExit(f"No images found for client {cid} classes {client_cls[cid]}")
-            selected = _ensure_len(pools, TRIGGERS_PER_CLIENT)
+def _encode_texts(texts: Sequence[str], *, tokenizer, model, device: torch.device) -> torch.Tensor:
+    with torch.no_grad():
+        tokens = tokenizer(list(texts)).to(device)
+        features = model.encode_text(tokens)
+        features = features / features.norm(dim=-1, keepdim=True)
+        return features.float().cpu()
+
+
+def prepare_triggers(args: argparse.Namespace) -> None:
+    seed = int(args.seed)
+    rng = random.Random(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    trigger_root = ensure_dir(Path(args.trigger_root).expanduser())
+
+    vg_root = Path(args.vg_root).expanduser() if args.vg_root else None
+    image_dirs: List[Path]
+    if args.vg_image_dirs:
+        image_dirs = [Path(p).expanduser() for p in args.vg_image_dirs]
+    elif vg_root:
+        image_dirs = [vg_root / "VG_100K", vg_root / "VG_100K_2"]
+    else:
+        image_dirs = []
+
+    objects_json = Path(args.objects_json).expanduser() if args.objects_json else None
+    cls2images: dict[str, List[Path]] = {}
+    client_classes: List[List[str]]
+
+    if objects_json and objects_json.exists():
+        cls_freq, cls2images = _index_objects(objects_json, image_dirs)
+        total_needed = args.num_clients * args.classes_per_client
+        top_classes = _pick_top_classes(cls_freq, cls2images, total_needed)
+        client_classes = _assign_classes_to_clients(top_classes, args.num_clients, args.classes_per_client)
+        print("Assigned classes per client:", client_classes)
+    else:
+        print("[WARN] objects.json not found; falling back to random image sampling.")
+        all_images = _list_all_images(image_dirs)
+        if not all_images:
+            raise SystemExit("[ERROR] No images available for trigger preparation.")
+        cls2images = {"__all__": all_images}
+        client_classes = [["random"] * args.classes_per_client for _ in range(args.num_clients)]
+
+    device = _resolve_device(args.device)
+    print(f"Using device: {device}")
+    model, preprocess, tokenizer = _load_model(args.model_name, args.pretrained, args.pretrained_hf, device)
+
+    texts_base_path = Path(args.texts_base).expanduser() if args.texts_base else None
+    base_texts = _load_texts_base(texts_base_path, args.triggers_per_client, rng)
+    text_source = str(texts_base_path) if texts_base_path and texts_base_path.exists() else "synthetic_templates"
+
+    for client_id in range(args.num_clients):
+        out_dir = ensure_dir(trigger_root / f"client_{client_id}")
+
+        if "__all__" in cls2images:
+            pool = cls2images["__all__"]
         else:
-            selected = _ensure_len(cls2images["__all__"], TRIGGERS_PER_CLIENT)
+            pool: List[Path] = []
+            for cls in client_classes[client_id]:
+                pool.extend(cls2images.get(cls, []))
+        selected = _ensure_len(pool, args.triggers_per_client, rng)
 
-        # 加载 & 预处理图片
-        imgs_tensor = []
-        with torch.no_grad():
-            pbar = tqdm(selected, desc=f"Client {cid} images")
-            for p in pbar:
-                img = Image.open(p).convert("RGB")
-                x = preprocess(img)                    # [3,H,W], range [0,1]
-                x = _add_gaussian_noise(x, std=NOISE_STD)
-                imgs_tensor.append(x.unsqueeze(0))
-            imgs = torch.cat(imgs_tensor, dim=0).to(device)      # [N,3,H,W]
+        image_features = _encode_images(selected,
+                                        preprocess=preprocess,
+                                        model=model,
+                                        device=device,
+                                        noise_std=args.noise_std)
+        text_features = _encode_texts(base_texts, tokenizer=tokenizer, model=model, device=device)
 
-            # 图像特征
-            img_feat = model.encode_image(imgs)                   # [N,D]
-            img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
-            img_feat = img_feat.float().cpu()
+        torch.save(image_features, out_dir / "image_embeddings.pt")
+        torch.save(text_features, out_dir / "text_embeddings.pt")
 
-        # 文本（这里按论文理解：所有客户端共用同一套 512 文本）
-        texts = _texts_for_client(base_texts)
-        with torch.no_grad():
-            tokens = tokenizer(texts).to(device)
-            txt_feat = model.encode_text(tokens)                  # [N,D]
-            txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
-            txt_feat = txt_feat.float().cpu()
-
-        assert img_feat.shape[0] == txt_feat.shape[0] == TRIGGERS_PER_CLIENT
-
-        # 保存嵌入
-        torch.save(img_feat, out_dir / "image_embeddings.pt")
-        torch.save(txt_feat, out_dir / "text_embeddings.pt")
-
-        # 也把“选了哪些图片 & 类别信息 & 文本”记录一下，便于追溯
-        meta = {
-            "client_id": cid,
-            "classes": client_cls[cid],
-            "num_triggers": TRIGGERS_PER_CLIENT,
-            "noise_std": NOISE_STD,
-            "model": MODEL_NAME,
-            "pretrained": PRETRAINED,
-            "images": [str(x) for x in selected],
-            "texts_source": "texts_base.txt" if TEXT_BASE.exists() else "synthetic_templates",
+        metadata = {
+            "client_id": client_id,
+            "classes": client_classes[client_id],
+            "num_triggers": args.triggers_per_client,
+            "noise_std": args.noise_std,
+            "model": args.model_name,
+            "pretrained": args.pretrained_hf or args.pretrained,
+            "images": [str(path) for path in selected],
+            "texts_source": text_source,
+            "image_embeddings": "image_embeddings.pt",
+            "text_embeddings": "text_embeddings.pt",
         }
-        (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        print(f"[Client {cid}] saved to {out_dir}, shape={tuple(img_feat.shape)}")
+        (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        print(f"[Client {client_id}] saved embeddings to {out_dir} with shape {tuple(image_features.shape)}")
 
-    print("All clients done:", TRIGGER_ROOT)
+    print(f"All clients completed. Artifacts stored under {trigger_root}.")
+
+
+def main(argv: Optional[Iterable[str]] = None) -> None:
+    parser = _build_argument_parser()
+    args = parser.parse_args(args=list(argv) if argv is not None else None)
+
+    if not args.trigger_root:
+        raise SystemExit("[ERROR] --trigger-root is required to save outputs.")
+    if not args.vg_root and not args.vg_image_dirs:
+        raise SystemExit("[ERROR] Provide --vg-root or explicit --vg-image-dir values.")
+
+    prepare_triggers(args)
+
 
 if __name__ == "__main__":
-    prepare_triggers()
+    main()
