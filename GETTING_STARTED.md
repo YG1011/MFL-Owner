@@ -87,6 +87,46 @@ pip install -e benchmarks/CLIP_benchmark
 
 > 如果你已有预训练好的触发矩阵，可直接将其放置到 `--watermark_dir` 指定目录，跳过训练步骤。
 
+### 5.1 生成白盒低秩指纹并设置验证实验
+
+若要复现本文档开头提到的“在参数空间嵌入低秩指纹”的白盒水印方案，可按以下步骤准备实验：
+
+1. **生成共享基与客户指纹**：
+   ```bash
+   python benchmarks/trigger/whitebox.py \
+       --output_dir /path/to/whitebox_assets \
+       --dim 768 \
+       --rank 32 \
+       --clients 0 1 2 3 \
+       --seed 1234 \
+       --scale 1.0 \
+       --mode diag
+   ```
+   该命令会写出 `U.pt`、`V.pt` 以及每个客户端唯一的 `Mi_client{c}.pt`，并附带 `metadata.json`。其中 `rank`=32 表示仅在 32 维子空间内嵌入指纹。
+
+2. **带白盒正则项的触发矩阵训练**：
+   ```bash
+   python benchmarks/trigger/training.py \
+       --data_root /path/to/trigger_embeddings \
+       --output_dir /path/to/watermark_results \
+       --trigger_num 512 \
+       --method noisy \
+       --client_list 0 1 2 3 \
+       --whitebox_gamma 1e-3 \
+       --wb_rank 32 \
+       --wb_U /path/to/whitebox_assets/U.pt \
+       --wb_V /path/to/whitebox_assets/V.pt \
+       --wb_M_dir /path/to/whitebox_assets \
+       --wb_report
+   ```
+   `--whitebox_gamma` 控制 Eq.(8) 中的惩罚强度，`--wb_rank` 必须与指纹生成时的 `rank` 一致；`--wb_report` 使训练脚本在每个客户端结束时打印白盒距离 `D_wb(i)` 作为验证指标。
+
+3. **水印验证实验**：
+   - **黑盒层面**：继续使用第 7 节的 `clip_benchmark eval` 命令，比较添加白盒正则前后的检索/分类精度差异，并关注日志中“Trigger_Verification”统计。
+   - **白盒层面**：检查训练日志里的 `D_wb(i)`，以及训练目录下缓存的 `B_client{i}.pt`（若启用 `--save_targets`）。你也可以编写脚本调用 `trigger.whitebox_distance()` 对比不同模型的指纹距离，实现归属判别实验。
+
+通过以上流程即可系统化地验证低秩指纹方案在黑盒与白盒场景下的有效性。
+
 ## 6. 组织水印目录结构
 评估脚本按照如下层级读取矩阵：
 ```

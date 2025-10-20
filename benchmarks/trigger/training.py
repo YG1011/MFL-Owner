@@ -231,7 +231,8 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     # 白盒指标准备
     wb_report = bool(args.get("wb_report"))
-    U_cache = V_cache = None
+    U_cache: dict[tuple[int, int], torch.Tensor] = {}
+    V_cache: dict[tuple[int, int], torch.Tensor] = {}
 
     for local_idx, client_id in enumerate(client_ids):
         Mi: torch.Tensor | None = None
@@ -255,15 +256,26 @@ def main(argv: Iterable[str] | None = None) -> None:
                       f"expected {trigger_num}, found {inferred_trigger_num}.")
 
             if whitebox_gamma > 0 or wb_report:
-                if U_cache is None or U_cache.shape[0] != dim:
-                    U_cache = load_basis(args.get("wb_U"), dim, device)
-                if V_cache is None or V_cache.shape[0] != dim:
-                    V_cache = load_basis(args.get("wb_V"), dim, device)
-                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device)
+                wb_rank = args.get("wb_rank")
+                rank = int(wb_rank) if wb_rank is not None else dim
+                if rank > dim:
+                    raise SystemExit(
+                        f"[ERROR] Client {client_id}: wb_rank ({rank}) cannot exceed dim ({dim})."
+                    )
+
+                cache_key = (dim, rank)
+                if cache_key not in U_cache:
+                    U_cache[cache_key] = load_basis(args.get("wb_U"), dim, device, rank=rank)
+                if cache_key not in V_cache:
+                    V_cache[cache_key] = load_basis(args.get("wb_V"), dim, device, rank=rank)
+                U_curr = U_cache[cache_key]
+                V_curr = V_cache[cache_key]
+
+                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device, rank=rank)
                 if whitebox_gamma > 0 and Mi is None:
                     print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
                 elif whitebox_gamma > 0 and Mi is not None:
-                    whitebox_payload = (U_cache, V_cache, Mi, whitebox_gamma)
+                    whitebox_payload = (U_curr, V_curr, Mi, whitebox_gamma)
 
             # 读取上一轮 W，或从 I 开始
             matrix_path = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
@@ -330,15 +342,26 @@ def main(argv: Iterable[str] | None = None) -> None:
                       f"expected {trigger_num}, found {inferred_trigger_num}.")
 
             if whitebox_gamma > 0 or wb_report:
-                if U_cache is None or U_cache.shape[0] != dim:
-                    U_cache = load_basis(args.get("wb_U"), dim, device)
-                if V_cache is None or V_cache.shape[0] != dim:
-                    V_cache = load_basis(args.get("wb_V"), dim, device)
-                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device)
+                wb_rank = args.get("wb_rank")
+                rank = int(wb_rank) if wb_rank is not None else dim
+                if rank > dim:
+                    raise SystemExit(
+                        f"[ERROR] Client {client_id}: wb_rank ({rank}) cannot exceed dim ({dim})."
+                    )
+
+                cache_key = (dim, rank)
+                if cache_key not in U_cache:
+                    U_cache[cache_key] = load_basis(args.get("wb_U"), dim, device, rank=rank)
+                if cache_key not in V_cache:
+                    V_cache[cache_key] = load_basis(args.get("wb_V"), dim, device, rank=rank)
+                U_curr = U_cache[cache_key]
+                V_curr = V_cache[cache_key]
+
+                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device, rank=rank)
                 if whitebox_gamma > 0 and Mi is None:
                     print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
                 elif whitebox_gamma > 0 and Mi is not None:
-                    whitebox_payload = (U_cache, V_cache, Mi, whitebox_gamma)
+                    whitebox_payload = (U_curr, V_curr, Mi, whitebox_gamma)
 
             matrix_path = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
             if matrix_path.exists():
@@ -384,14 +407,27 @@ def main(argv: Iterable[str] | None = None) -> None:
         # -----------------------------
         if wb_report:
             dim_w = matrix.shape[0]
-            if U_cache is None or U_cache.shape[0] != dim_w:
-                U_cache = load_basis(args.get("wb_U"), dim_w, device)
-            if V_cache is None or V_cache.shape[0] != dim_w:
-                V_cache = load_basis(args.get("wb_V"), dim_w, device)
+            wb_rank = args.get("wb_rank")
+            rank = int(wb_rank) if wb_rank is not None else dim_w
+            if rank > dim_w:
+                raise SystemExit(
+                    f"[ERROR] Client {client_id}: wb_rank ({rank}) cannot exceed dim ({dim_w})."
+                )
 
-            Mi_report = Mi if Mi is not None else load_Mi(args.get("wb_M_dir"), client_id, dim_w, device)
+            cache_key = (dim_w, rank)
+            if cache_key not in U_cache:
+                U_cache[cache_key] = load_basis(args.get("wb_U"), dim_w, device, rank=rank)
+            if cache_key not in V_cache:
+                V_cache[cache_key] = load_basis(args.get("wb_V"), dim_w, device, rank=rank)
+
+            U_eval = U_cache[cache_key]
+            V_eval = V_cache[cache_key]
+
+            Mi_report = Mi if Mi is not None else load_Mi(
+                args.get("wb_M_dir"), client_id, dim_w, device, rank=rank
+            )
             if Mi_report is not None:
-                d_wb = whitebox_distance(matrix.to(device), U_cache, V_cache, Mi_report)
+                d_wb = whitebox_distance(matrix.to(device), U_eval, V_eval, Mi_report)
                 print(f"[WhiteBox] client {client_id}: D_wb = {d_wb:.6f}")
             else:
                 print(f"[WhiteBox] client {client_id}: Mi not provided, skip.")
