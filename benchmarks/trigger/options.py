@@ -106,9 +106,6 @@ def get_parser_args(argv: Optional[Iterable[str]] = None) -> Dict[str, object]:
                         help="Path to orthogonal basis V (pt/pth/npy/npz). Use identity if absent.")
     parser.add_argument("--wb_M_dir", type=str, default=os.environ.get("WBOX_M_DIR"),
                         help="Directory containing Mi per client: Mi_client{c}.pt")
-    parser.add_argument("--wb_rank", type=int,
-                        default=_env_int("WBOX_RANK", None),
-                        help="Latent fingerprint rank k (default: use full dim).")
     parser.add_argument("--wb_report", action="store_true",
                         help="Report white-box distance D_wb(i) after training/updating.")
     parser.add_argument("--whitebox_gamma", type=float,
@@ -121,6 +118,14 @@ def get_parser_args(argv: Optional[Iterable[str]] = None) -> Dict[str, object]:
     parser.add_argument("--target_dir", type=str,
                         default=os.environ.get("TRIGGER_TARGET_DIR"),
                         help="Output directory for saved encoded triggers B_i.")
+
+    # 读/写矩阵目录与旧后缀 ---
+    parser.add_argument("--prev_w_dir", type=str, default=None,
+                        help="Directory to load previous W (e.g., plain_w). If not set, falls back to save dir.")
+    parser.add_argument("--save_w_dir", type=str, default=None,
+                        help="Directory to save current W (overrides output_dir/<method>_w when set).")
+    parser.add_argument("--prev_w_method", type=str, default=None,
+                        help="Method suffix of previous W filenames (e.g., 'plain' or 'dynamic'); if omitted, will try a few common suffixes automatically.")
 
 
     args = parser.parse_args(args=list(argv) if argv is not None else None)
