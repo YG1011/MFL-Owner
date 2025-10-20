@@ -218,6 +218,9 @@ def main(argv: Iterable[str] | None = None) -> None:
     time_mu        = float(args.get("time_mu", 0.0))
     batch_size_arg = args.get("batch_size")
     whitebox_gamma = float(args.get("whitebox_gamma", 0.0))
+    wb_rank = args.get("wb_rank")
+    if wb_rank is not None:
+        wb_rank = int(wb_rank)
     save_targets   = bool(args.get("save_targets"))
     target_dir_opt = args.get("target_dir")
 
@@ -307,10 +310,10 @@ def main(argv: Iterable[str] | None = None) -> None:
 
             if whitebox_gamma > 0 or wb_report:
                 if U_cache is None or U_cache.shape[0] != dim:
-                    U_cache = load_basis(args.get("wb_U"), dim, device)
+                    U_cache = load_basis(args.get("wb_U"), dim, device, rank=wb_rank)
                 if V_cache is None or V_cache.shape[0] != dim:
-                    V_cache = load_basis(args.get("wb_V"), dim, device)
-                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device)
+                    V_cache = load_basis(args.get("wb_V"), dim, device, rank=wb_rank)
+                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device, rank=wb_rank)
                 if whitebox_gamma > 0 and Mi is None:
                     print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
                 elif whitebox_gamma > 0 and Mi is not None:
@@ -385,10 +388,10 @@ def main(argv: Iterable[str] | None = None) -> None:
 
             if whitebox_gamma > 0 or wb_report:
                 if U_cache is None or U_cache.shape[0] != dim:
-                    U_cache = load_basis(args.get("wb_U"), dim, device)
+                    U_cache = load_basis(args.get("wb_U"), dim, device, rank=wb_rank)
                 if V_cache is None or V_cache.shape[0] != dim:
-                    V_cache = load_basis(args.get("wb_V"), dim, device)
-                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device)
+                    V_cache = load_basis(args.get("wb_V"), dim, device, rank=wb_rank)
+                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device, rank=wb_rank)
                 if whitebox_gamma > 0 and Mi is None:
                     print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
                 elif whitebox_gamma > 0 and Mi is not None:
@@ -439,11 +442,13 @@ def main(argv: Iterable[str] | None = None) -> None:
         if wb_report:
             dim_w = matrix.shape[0]
             if U_cache is None or U_cache.shape[0] != dim_w:
-                U_cache = load_basis(args.get("wb_U"), dim_w, device)
+                U_cache = load_basis(args.get("wb_U"), dim_w, device, rank=wb_rank)
             if V_cache is None or V_cache.shape[0] != dim_w:
-                V_cache = load_basis(args.get("wb_V"), dim_w, device)
+                V_cache = load_basis(args.get("wb_V"), dim_w, device, rank=wb_rank)
 
-            Mi_report = Mi if Mi is not None else load_Mi(args.get("wb_M_dir"), client_id, dim_w, device)
+            Mi_report = Mi if Mi is not None else load_Mi(
+                args.get("wb_M_dir"), client_id, dim_w, device, rank=wb_rank
+            )
             if Mi_report is not None:
                 d_wb = whitebox_distance(matrix.to(device), U_cache, V_cache, Mi_report)
                 print(f"[WhiteBox] client {client_id}: D_wb = {d_wb:.6f}")

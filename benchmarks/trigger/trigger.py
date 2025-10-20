@@ -224,26 +224,75 @@ def blackbox_statistics(
 # 4) 白盒指标/基/水印加载
 # -----------------------------
 
-def load_basis(path: Optional[str], dim: int, device: torch.device) -> torch.Tensor:
-    """
-    读取正交基 U/V；若 path 为空则返回 I。
-    若不是严格正交，会做一次 QR 以正交化。
-    """
-    if not path:
-        return torch.eye(dim, device=device)
-    B = _load_tensor(path, map_location=device).to(device).float()
-    if B.ndim != 2 or B.shape[0] != dim:
-        raise ValueError(f"Basis at {path} must be 2-D with first dim={dim}, got {tuple(B.shape)}")
-    # 简单正交化
-    Q, _ = torch.linalg.qr(B, mode="reduced")
-    return Q
+def load_basis(
+    path: Optional[str],
+    dim: int,
+    device: torch.device,
+    *,
+    rank: Optional[int] = None,
+) -> torch.Tensor:
+    """Load an orthonormal basis ``U``/``V`` for the white-box subspace.
 
-def load_Mi(m_dir: Optional[str], client_id: int, dim: int, device: torch.device) -> Optional[torch.Tensor]:
+    Parameters
+    ----------
+    path:
+        Location of the serialized basis.  When ``None`` an identity basis is
+        synthesised.
+    dim:
+        Ambient dimensionality ``d`` of the trigger matrix.
+    device:
+        Target device for the returned tensor.
+    rank:
+        Optional rank ``k`` of the white-box subspace.  When provided the
+        routine returns only the leading ``k`` columns of the orthonormal basis,
+        matching the low-rank formulation in the paper.  ``None`` keeps all
+        columns.
     """
-    在目录里查找 Mi 文件，常见命名：
-      Mi_client{c}.pt / Mi_c{c}.pt / Mi_{c}.pt / client_{c}.pt
-    若不存在返回 None。
+
+    if rank is not None and rank <= 0:
+        raise ValueError("rank must be positive when specified")
+
+    if not path:
+        basis = torch.eye(dim, device=device)
+    else:
+        B = _load_tensor(path, map_location=device).to(device).float()
+        if B.ndim != 2 or B.shape[0] != dim:
+            raise ValueError(
+                f"Basis at {path} must be 2-D with first dim={dim}, got {tuple(B.shape)}"
+            )
+        # ``torch.linalg.qr`` with ``mode='reduced'`` yields ``(dim, min(dim, n))``.
+        Q, _ = torch.linalg.qr(B, mode="reduced")
+        basis = Q
+
+    if rank is not None:
+        if rank > basis.shape[1]:
+            raise ValueError(
+                f"Requested rank {rank} exceeds available columns {basis.shape[1]} in basis"
+            )
+        basis = basis[:, :rank]
+
+    return basis
+
+
+def load_Mi(
+    m_dir: Optional[str],
+    client_id: int,
+    dim: int,
+    device: torch.device,
+    *,
+    rank: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    """Load client-specific fingerprint ``M_i`` if present.
+
+    ``M_i`` is expected to be a ``rank × rank`` tensor that lives in the
+    low-rank white-box subspace.  For backward compatibility the loader also
+    accepts ``dim × dim`` matrices and projects them onto the leading ``rank``
+    components when a rank is specified.
     """
+
+    if rank is not None and rank <= 0:
+        raise ValueError("rank must be positive when specified")
+
     if not m_dir:
         return None
     m_dir = str(m_dir)
@@ -259,9 +308,24 @@ def load_Mi(m_dir: Optional[str], client_id: int, dim: int, device: torch.device
             p = Path(m_dir).expanduser() / f"{base}{suf}"
             if p.exists():
                 M = _load_tensor(p, map_location=device).to(device).float()
-                if M.shape != (dim, dim):
-                    raise ValueError(f"Mi at {p} must be [{dim},{dim}], got {tuple(M.shape)}")
-                return M
+                if M.ndim != 2:
+                    raise ValueError(f"Mi at {p} must be 2-D, got {tuple(M.shape)}")
+                if rank is None:
+                    if M.shape != (dim, dim):
+                        raise ValueError(
+                            f"Mi at {p} must be [{dim},{dim}] when rank is not specified, got {tuple(M.shape)}"
+                        )
+                    return M
+                # Rank-aware path: accept either ``(rank, rank)`` directly or
+                # ``(dim, dim)`` which we project onto the leading ``rank``
+                # components for compatibility with older assets.
+                if M.shape == (rank, rank):
+                    return M
+                if M.shape == (dim, dim):
+                    return M[:rank, :rank]
+                raise ValueError(
+                    f"Mi at {p} must be ({rank},{rank}) or ({dim},{dim}), got {tuple(M.shape)}"
+                )
     return None
 
 @torch.no_grad()
