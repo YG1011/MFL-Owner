@@ -119,7 +119,7 @@ def procrustes_rotation(E_new: torch.Tensor, E_old: torch.Tensor) -> torch.Tenso
             "E_new and E_old must be two 2-D tensors with identical shapes for Procrustes alignment"
         )
 
-    C = E_new.T @ E_old  # [d, d]
+    C = E_old.T @ E_new  # [d, d]
     U, _, Vh = torch.linalg.svd(C, full_matrices=False)
     R = U @ Vh
 
@@ -137,7 +137,7 @@ def procrustes_rotation(E_new: torch.Tensor, E_old: torch.Tensor) -> torch.Tenso
 def dynamic_watermark_update(W_old: torch.Tensor, R: torch.Tensor, beta: float) -> torch.Tensor:
     """Adaptive update ``W_old`` using rotation ``R`` and orthogonal relaxation ``beta``."""
 
-    W_rot = (R @ W_old).to(dtype=W_old.dtype)
+    W_rot = (W_old @ R).to(dtype=W_old.dtype)
     if beta <= 0:
         return W_rot
 
@@ -224,62 +224,21 @@ def blackbox_statistics(
 # 4) 白盒指标/基/水印加载
 # -----------------------------
 
-def load_basis(
-    path: Optional[str],
-    dim: int,
-    device: torch.device,
-    *,
-    rank: Optional[int] = None,
-) -> torch.Tensor:
-    """Load an orthogonal basis with optional low-rank support.
-
-    Parameters
-    ----------
-    path:
-        Path to the basis tensor. If ``None``/empty, an identity basis is
-        returned (optionally truncated to ``rank`` columns).
-    dim:
-        Ambient dimension ``d`` of the encoder weight.
-    rank:
-        Optional latent dimension ``k``. When provided, the returned basis has
-        exactly ``k`` columns. When omitted, all columns from the stored tensor
-        are kept.
+def load_basis(path: Optional[str], dim: int, device: torch.device) -> torch.Tensor:
     """
-
-    if rank is not None and rank > dim:
-        raise ValueError(f"rank ({rank}) must be <= dim ({dim})")
-
+    读取正交基 U/V；若 path 为空则返回 I。
+    若不是严格正交，会做一次 QR 以正交化。
+    """
     if not path:
-        basis = torch.eye(dim, device=device)
-        if rank is not None and rank < dim:
-            basis = basis[:, :rank]
-        return basis
-
+        return torch.eye(dim, device=device)
     B = _load_tensor(path, map_location=device).to(device).float()
     if B.ndim != 2 or B.shape[0] != dim:
-        raise ValueError(
-            f"Basis at {path} must be 2-D with first dim={dim}, got {tuple(B.shape)}"
-        )
-
-    # QR decomposition ensures orthogonality even if the provided basis is only
-    # approximately orthogonal. ``mode='reduced'`` yields shape (dim, m) where
-    # m = min(dim, original_rank).
+        raise ValueError(f"Basis at {path} must be 2-D with first dim={dim}, got {tuple(B.shape)}")
+    # 简单正交化
     Q, _ = torch.linalg.qr(B, mode="reduced")
-
-    if rank is not None and Q.shape[1] > rank:
-        Q = Q[:, :rank]
-
     return Q
 
-
-def load_Mi(
-    m_dir: Optional[str],
-    client_id: int,
-    dim: int,
-    device: torch.device,
-    *,
-    rank: Optional[int] = None,
-) -> Optional[torch.Tensor]:
+def load_Mi(m_dir: Optional[str], client_id: int, dim: int, device: torch.device) -> Optional[torch.Tensor]:
     """
     在目录里查找 Mi 文件，常见命名：
       Mi_client{c}.pt / Mi_c{c}.pt / Mi_{c}.pt / client_{c}.pt
@@ -300,23 +259,9 @@ def load_Mi(
             p = Path(m_dir).expanduser() / f"{base}{suf}"
             if p.exists():
                 M = _load_tensor(p, map_location=device).to(device).float()
-                expected = (rank or dim, rank or dim)
-                if M.ndim != 2:
-                    raise ValueError(
-                        f"Mi at {p} must be a 2-D tensor, got shape {tuple(M.shape)}"
-                    )
-
-                if M.shape == expected:
-                    return M
-
-                # Backwards compatibility: allow full-dimension Mi when a
-                # lower rank is requested by slicing the leading block.
-                if rank is not None and M.shape == (dim, dim):
-                    return M[:rank, :rank]
-
-                raise ValueError(
-                    f"Mi at {p} must have shape {expected}, got {tuple(M.shape)}"
-                )
+                if M.shape != (dim, dim):
+                    raise ValueError(f"Mi at {p} must be [{dim},{dim}], got {tuple(M.shape)}")
+                return M
     return None
 
 @torch.no_grad()
