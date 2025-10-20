@@ -106,6 +106,9 @@ def get_parser_args(argv: Optional[Iterable[str]] = None) -> Dict[str, object]:
                         help="Path to orthogonal basis V (pt/pth/npy/npz). Use identity if absent.")
     parser.add_argument("--wb_M_dir", type=str, default=os.environ.get("WBOX_M_DIR"),
                         help="Directory containing Mi per client: Mi_client{c}.pt")
+    parser.add_argument("--wb_rank", type=int,
+                        default=_env_int("WBOX_RANK", None),
+                        help="Latent fingerprint rank k (default: use full dim).")
     parser.add_argument("--wb_report", action="store_true",
                         help="Report white-box distance D_wb(i) after training/updating.")
     parser.add_argument("--whitebox_gamma", type=float,
