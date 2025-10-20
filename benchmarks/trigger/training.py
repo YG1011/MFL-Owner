@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, Optional, List
+import glob
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +44,39 @@ def _cosine_and_l2(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torc
     cosine = F.cosine_similarity(a, b, dim=1, eps=1e-6)
     l2 = F.pairwise_distance(a, b, p=2)
     return cosine, l2
+
+def _find_prev_matrix(
+    prev_dir: Path,
+    client_id: int,
+    trigger_num: int,
+    preferred_method: Optional[str] = None
+) -> Optional[Path]:
+    """
+    在 prev_dir 下尝试多种命名，找到上一轮的 W 路径。
+    返回第一个存在的路径；找不到则返回 None。
+    """
+    candidates: List[Path] = []
+
+    # 明确后缀优先
+    if preferred_method:
+        candidates.append(prev_dir / f"trigger_mat_c{client_id}_{trigger_num}_{preferred_method}.pth")
+
+    # 常见后缀兜底
+    for suf in ["dynamic", "plain", "orthogonal", "random", "noisy"]:
+        p = prev_dir / f"trigger_mat_c{client_id}_{trigger_num}_{suf}.pth"
+        if p not in candidates:
+            candidates.append(p)
+
+    # 最后通配匹配（例如自定义命名）
+    wildcard_list = sorted(prev_dir.glob(f"trigger_mat_c{client_id}_{trigger_num}_*.pth"))
+    for p in wildcard_list:
+        if p not in candidates:
+            candidates.append(p)
+
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
 
 # -----------------------------
 # 静态训练一个 Wi
@@ -164,6 +198,11 @@ def main(argv: Iterable[str] | None = None) -> None:
     device = _select_device(str(args["device"]))
     print(f"Using device: {device}")
 
+    # 新增：读/写目录与旧后缀参数（需要在 options.py 中添加）
+    prev_w_dir_opt = args.get("prev_w_dir")
+    save_w_dir_opt = args.get("save_w_dir")
+    prev_w_method  = args.get("prev_w_method")
+
     # 输入路径
     data_root = args.get("data_root")
     prev_root = args.get("prev_data_root")
@@ -218,8 +257,20 @@ def main(argv: Iterable[str] | None = None) -> None:
     # 输出目录
     output_root = Path(str(args["output_dir"]))
     method_dir_name = method if method.endswith("_w") else f"{method}_w"
-    save_dir = output_root.expanduser() / method_dir_name
+
+    # 允许 --save_w_dir 覆盖保存目录
+    if save_w_dir_opt:
+        save_dir = Path(save_w_dir_opt).expanduser()
+    else:
+        save_dir = output_root.expanduser() / method_dir_name
     save_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[IO] Save dir = {save_dir}")
+
+    # 上一轮目录（若不给则退回 save_dir）
+    prev_w_dir = Path(prev_w_dir_opt).expanduser() if prev_w_dir_opt else save_dir
+    if prev_w_dir_opt:
+        prev_w_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[IO] Prev-W dir = {prev_w_dir}")
 
     target_dir = None
     if save_targets:
@@ -231,8 +282,7 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     # 白盒指标准备
     wb_report = bool(args.get("wb_report"))
-    U_cache: dict[tuple[int, int], torch.Tensor] = {}
-    V_cache: dict[tuple[int, int], torch.Tensor] = {}
+    U_cache = V_cache = None
 
     for local_idx, client_id in enumerate(client_ids):
         Mi: torch.Tensor | None = None
@@ -256,38 +306,30 @@ def main(argv: Iterable[str] | None = None) -> None:
                       f"expected {trigger_num}, found {inferred_trigger_num}.")
 
             if whitebox_gamma > 0 or wb_report:
-                wb_rank = args.get("wb_rank")
-                rank = int(wb_rank) if wb_rank is not None else dim
-                if rank > dim:
-                    raise SystemExit(
-                        f"[ERROR] Client {client_id}: wb_rank ({rank}) cannot exceed dim ({dim})."
-                    )
-
-                cache_key = (dim, rank)
-                if cache_key not in U_cache:
-                    U_cache[cache_key] = load_basis(args.get("wb_U"), dim, device, rank=rank)
-                if cache_key not in V_cache:
-                    V_cache[cache_key] = load_basis(args.get("wb_V"), dim, device, rank=rank)
-                U_curr = U_cache[cache_key]
-                V_curr = V_cache[cache_key]
-
-                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device, rank=rank)
+                if U_cache is None or U_cache.shape[0] != dim:
+                    U_cache = load_basis(args.get("wb_U"), dim, device)
+                if V_cache is None or V_cache.shape[0] != dim:
+                    V_cache = load_basis(args.get("wb_V"), dim, device)
+                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device)
                 if whitebox_gamma > 0 and Mi is None:
                     print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
                 elif whitebox_gamma > 0 and Mi is not None:
-                    whitebox_payload = (U_curr, V_curr, Mi, whitebox_gamma)
+                    whitebox_payload = (U_cache, V_cache, Mi, whitebox_gamma)
 
-            # 读取上一轮 W，或从 I 开始
-            matrix_path = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
-            if matrix_path.exists() and args.get("init_from_existing"):
-                W_old = torch.load(matrix_path, map_location=device).to(device).float()
-                print(f"==> Client {client_id}: loaded previous W from {matrix_path}")
+            # 读取上一轮 W（优先 prev_w_dir），或从 I 开始
+            matrix_path_new = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
+            matrix_path_old = _find_prev_matrix(prev_w_dir, client_id, trigger_num, prev_w_method)
+
+            if matrix_path_old is not None and args.get("init_from_existing"):
+                W_old = torch.load(matrix_path_old, map_location=device).to(device).float()
+                print(f"==> Client {client_id}: loaded previous W from {matrix_path_old}")
             else:
                 W_old = torch.eye(dim, device=device)
-                print(f"==> Client {client_id}: start from identity W (no existing matrix or not requested).")
+                msg = "(no existing matrix found)" if matrix_path_old is None else "(init_from_existing not set)"
+                print(f"==> Client {client_id}: start from identity W {msg}.")
 
-            # Procrustes：R* 使得 E_new R ≈ E_old
-            R_star = procrustes_rotation(E_new, E_old)
+            # Procrustes：R* 使得 E_old ≈ E_new R
+            R_star = procrustes_rotation(E_old, E_new)
             W_new = dynamic_watermark_update(W_old, R_star, beta)
             W_new = time_consistency_update(
                 W_new,
@@ -301,8 +343,8 @@ def main(argv: Iterable[str] | None = None) -> None:
                 U_dyn, V_dyn, Mi_dyn, gamma_dyn = whitebox_payload
                 W_new = apply_whitebox_penalty(W_new, U_dyn, V_dyn, Mi_dyn, gamma_dyn)
 
-            torch.save(W_new.detach().cpu(), matrix_path)
-            print(f"[Dynamic] Client {client_id}: saved updated matrix to {matrix_path}")
+            torch.save(W_new.detach().cpu(), matrix_path_new)
+            print(f"[Dynamic] Client {client_id}: saved updated matrix to {matrix_path_new}")
 
             # 正确的动态验证：新@W_new vs 旧@W_old
             print(f"[DEBUG] client {client_id}: "
@@ -342,26 +384,15 @@ def main(argv: Iterable[str] | None = None) -> None:
                       f"expected {trigger_num}, found {inferred_trigger_num}.")
 
             if whitebox_gamma > 0 or wb_report:
-                wb_rank = args.get("wb_rank")
-                rank = int(wb_rank) if wb_rank is not None else dim
-                if rank > dim:
-                    raise SystemExit(
-                        f"[ERROR] Client {client_id}: wb_rank ({rank}) cannot exceed dim ({dim})."
-                    )
-
-                cache_key = (dim, rank)
-                if cache_key not in U_cache:
-                    U_cache[cache_key] = load_basis(args.get("wb_U"), dim, device, rank=rank)
-                if cache_key not in V_cache:
-                    V_cache[cache_key] = load_basis(args.get("wb_V"), dim, device, rank=rank)
-                U_curr = U_cache[cache_key]
-                V_curr = V_cache[cache_key]
-
-                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device, rank=rank)
+                if U_cache is None or U_cache.shape[0] != dim:
+                    U_cache = load_basis(args.get("wb_U"), dim, device)
+                if V_cache is None or V_cache.shape[0] != dim:
+                    V_cache = load_basis(args.get("wb_V"), dim, device)
+                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device)
                 if whitebox_gamma > 0 and Mi is None:
                     print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
                 elif whitebox_gamma > 0 and Mi is not None:
-                    whitebox_payload = (U_curr, V_curr, Mi, whitebox_gamma)
+                    whitebox_payload = (U_cache, V_cache, Mi, whitebox_gamma)
 
             matrix_path = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
             if matrix_path.exists():
@@ -407,27 +438,14 @@ def main(argv: Iterable[str] | None = None) -> None:
         # -----------------------------
         if wb_report:
             dim_w = matrix.shape[0]
-            wb_rank = args.get("wb_rank")
-            rank = int(wb_rank) if wb_rank is not None else dim_w
-            if rank > dim_w:
-                raise SystemExit(
-                    f"[ERROR] Client {client_id}: wb_rank ({rank}) cannot exceed dim ({dim_w})."
-                )
+            if U_cache is None or U_cache.shape[0] != dim_w:
+                U_cache = load_basis(args.get("wb_U"), dim_w, device)
+            if V_cache is None or V_cache.shape[0] != dim_w:
+                V_cache = load_basis(args.get("wb_V"), dim_w, device)
 
-            cache_key = (dim_w, rank)
-            if cache_key not in U_cache:
-                U_cache[cache_key] = load_basis(args.get("wb_U"), dim_w, device, rank=rank)
-            if cache_key not in V_cache:
-                V_cache[cache_key] = load_basis(args.get("wb_V"), dim_w, device, rank=rank)
-
-            U_eval = U_cache[cache_key]
-            V_eval = V_cache[cache_key]
-
-            Mi_report = Mi if Mi is not None else load_Mi(
-                args.get("wb_M_dir"), client_id, dim_w, device, rank=rank
-            )
+            Mi_report = Mi if Mi is not None else load_Mi(args.get("wb_M_dir"), client_id, dim_w, device)
             if Mi_report is not None:
-                d_wb = whitebox_distance(matrix.to(device), U_eval, V_eval, Mi_report)
+                d_wb = whitebox_distance(matrix.to(device), U_cache, V_cache, Mi_report)
                 print(f"[WhiteBox] client {client_id}: D_wb = {d_wb:.6f}")
             else:
                 print(f"[WhiteBox] client {client_id}: Mi not provided, skip.")
