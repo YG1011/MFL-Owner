@@ -114,6 +114,19 @@ def get_parser_args(argv: Optional[Iterable[str]] = None) -> Dict[str, object]:
     parser.add_argument("--whitebox_gamma", type=float,
                         default=_env_float("TRIGGER_WHITEBOX_GAMMA", 0.0),
                         help="Weight γ for white-box fingerprint regularisation (Eq. 8).")
+    parser.add_argument("--whitebox_margin", type=float,
+                        default=_env_float("TRIGGER_WHITEBOX_MARGIN", 0.5),
+                        help="Margin τ for hinge-style contrast between client fingerprints (default: 0.5).")
+    parser.add_argument("--whitebox_contrast_weight", type=float,
+                        default=_env_float("TRIGGER_WHITEBOX_CONTRAST", 1.0),
+                        help="Weight λ for cross-client contrastive penalty (default: 1.0).")
+    parser.add_argument(
+        "--whitebox_transform",
+        type=str,
+        default=os.environ.get("TRIGGER_WHITEBOX_TRANSFORM", "diag_hadamard"),
+        choices=["identity", "diag", "hadamard", "diag_hadamard"],
+        help="Linear transform applied inside the white-box penalty (default: diag_hadamard).",
+    )
 
     # === 触发目标持久化 ===
     parser.add_argument("--save_targets", action="store_true",
