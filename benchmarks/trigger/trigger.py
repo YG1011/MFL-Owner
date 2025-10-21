@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+_HADAMARD_CACHE: Dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
 
 # -----------------------------
 # 1) 与数据相关（保留原实现）
@@ -145,6 +148,85 @@ def dynamic_watermark_update(W_old: torch.Tensor, R: torch.Tensor, beta: float) 
     return (1.0 + beta) * W_rot - beta * gram @ W_rot
 
 
+def hadamard_matrix(order: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+    """Return a normalised Hadamard matrix of ``order`` when available."""
+
+    if order <= 0 or order & (order - 1):  # not a power of two
+        return None
+
+    cache_key = (order, device, dtype)
+    if cache_key in _HADAMARD_CACHE:
+        return _HADAMARD_CACHE[cache_key]
+
+    H = torch.tensor([[1.0]], dtype=dtype, device=device)
+    size = 1
+    while size < order:
+        top = torch.cat([H, H], dim=1)
+        bottom = torch.cat([H, -H], dim=1)
+        H = torch.cat([top, bottom], dim=0)
+        size *= 2
+
+    H = H / math.sqrt(order)
+    _HADAMARD_CACHE[cache_key] = H
+    return H
+
+
+def build_whitebox_transform(
+    Mi: torch.Tensor,
+    *,
+    mode: str = "diag_hadamard",
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Construct linear transforms applied inside the white-box penalty.
+
+    The routine returns left/right matrices ``(L, R)`` so that a projection ``P``
+    is transformed as ``L @ P @ R`` before measuring distances.  ``mode``
+    controls which transforms are included:
+
+    ``identity``
+        Leave the projection untouched.
+    ``diag``
+        Scale by the absolute value of ``Mi``'s diagonal entries.
+    ``hadamard``
+        Apply a normalised Hadamard transform (only when the rank is a power of
+        two).
+    ``diag_hadamard``
+        Apply diagonal scaling followed by the Hadamard transform.
+    """
+
+    mode = mode.lower()
+    if mode not in {"identity", "diag", "hadamard", "diag_hadamard"}:
+        raise ValueError(f"Unsupported white-box transform mode: {mode}")
+
+    rank = Mi.shape[0]
+    device = Mi.device
+    dtype = Mi.dtype
+
+    left = torch.eye(rank, device=device, dtype=dtype)
+    right = torch.eye(rank, device=device, dtype=dtype)
+    changed = False
+
+    if mode in {"diag", "diag_hadamard"}:
+        diag = torch.diagonal(Mi).abs()
+        if torch.count_nonzero(diag) > 0:
+            diag = diag / diag.norm(p=2).clamp_min(1e-6)
+            D = torch.diag(diag)
+            left = D @ left
+            right = right @ D
+            changed = True
+
+    if mode in {"hadamard", "diag_hadamard"}:
+        H = hadamard_matrix(rank, device=device, dtype=dtype)
+        if H is not None:
+            left = H @ left
+            right = right @ H
+            changed = True
+
+    if not changed:
+        return None, None
+
+    return left, right
+
+
 @torch.no_grad()
 def time_consistency_update(
     W_candidate: torch.Tensor,
@@ -173,15 +255,53 @@ def apply_whitebox_penalty(
     V: torch.Tensor,
     Mi: torch.Tensor,
     gamma: float,
+    *,
+    margin: float = 0.0,
+    contrast_weight: float = 0.0,
+    contrast_targets: Sequence[torch.Tensor] | None = None,
+    left: torch.Tensor | None = None,
+    right: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Single proximal step towards the fingerprint target ``Mi``."""
 
-    if gamma <= 0:
+    if gamma <= 0 or Mi is None:
         return W
 
-    diff = U.T @ W @ V - Mi
-    grad = U @ diff @ V.T
-    return (W - 2.0 * gamma * grad).to(W.dtype)
+    contrast_targets = tuple(contrast_targets or ())
+
+    proj = U.T @ W @ V
+    if left is not None:
+        proj = left @ proj
+    if right is not None:
+        proj = proj @ right
+
+    diff = proj - Mi
+
+    back = diff
+    if left is not None:
+        back = left.T @ back
+    if right is not None:
+        back = back @ right.T
+    grad = U @ back @ V.T
+    W = (W - 2.0 * gamma * grad).to(W.dtype)
+
+    if margin > 0 and contrast_weight > 0 and contrast_targets:
+        for other in contrast_targets:
+            diff_other = proj - other
+            dist = torch.linalg.norm(diff_other, ord="fro")
+            dist_value = float(dist)
+            if dist_value < margin:
+                denom = max(dist_value, 1e-6)
+                direction = diff_other / denom
+                back_dir = direction
+                if left is not None:
+                    back_dir = left.T @ back_dir
+                if right is not None:
+                    back_dir = back_dir @ right.T
+                grad_contrast = U @ back_dir @ V.T
+                W = (W + gamma * contrast_weight * grad_contrast).to(W.dtype)
+
+    return W
 
 
 @torch.no_grad()
@@ -352,6 +472,8 @@ __all__ = [
     "apply_whitebox_penalty",
     "encode_targets",
     "blackbox_statistics",
+    "hadamard_matrix",
+    "build_whitebox_transform",
     # 白盒
     "load_basis",
     "load_Mi",

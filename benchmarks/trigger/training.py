@@ -2,10 +2,11 @@
 """Train / update watermark trigger alignment matrices (static + dynamic)."""
 from __future__ import annotations
 
-import math
-from pathlib import Path
-from typing import Iterable, Tuple, Optional, List
 import glob
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,7 @@ from trigger import (
     apply_whitebox_penalty,
     encode_targets,
     blackbox_statistics,
+    build_whitebox_transform,
     load_basis,
     load_Mi,
     whitebox_distance,
@@ -78,6 +80,112 @@ def _find_prev_matrix(
             return p
     return None
 
+
+@dataclass
+class WhiteboxPenaltyPayload:
+    U: torch.Tensor
+    V: torch.Tensor
+    target: torch.Tensor
+    gamma: float
+    margin: float
+    contrast_weight: float
+    contrasts: Tuple[torch.Tensor, ...]
+    left: torch.Tensor | None = None
+    right: torch.Tensor | None = None
+
+
+def _apply_transform(matrix: torch.Tensor, left: torch.Tensor | None, right: torch.Tensor | None) -> torch.Tensor:
+    if left is not None:
+        matrix = left @ matrix
+    if right is not None:
+        matrix = matrix @ right
+    return matrix
+
+
+def _make_whitebox_payload(
+    *,
+    U: torch.Tensor,
+    V: torch.Tensor,
+    Mi: torch.Tensor | None,
+    gamma: float,
+    margin: float,
+    contrast_weight: float,
+    contrast_targets: Sequence[torch.Tensor],
+    transform_mode: str,
+) -> WhiteboxPenaltyPayload | None:
+    if Mi is None or gamma <= 0:
+        return None
+
+    Mi = Mi.to(device=U.device, dtype=U.dtype)
+    left: torch.Tensor | None = None
+    right: torch.Tensor | None = None
+    if transform_mode and transform_mode.lower() != "identity":
+        left, right = build_whitebox_transform(Mi, mode=transform_mode)
+        if left is not None:
+            left = left.to(device=U.device, dtype=U.dtype)
+        if right is not None:
+            right = right.to(device=U.device, dtype=U.dtype)
+
+    target = _apply_transform(Mi, left, right)
+
+    contrast_list = [
+        _apply_transform(m.to(device=U.device, dtype=U.dtype), left, right)
+        for m in contrast_targets
+    ]
+
+    return WhiteboxPenaltyPayload(
+        U=U,
+        V=V,
+        target=target,
+        gamma=gamma,
+        margin=margin,
+        contrast_weight=contrast_weight,
+        contrasts=tuple(contrast_list),
+        left=left,
+        right=right,
+    )
+
+
+def _whitebox_regularizer(matrix: torch.Tensor, payload: WhiteboxPenaltyPayload | None) -> torch.Tensor:
+    if payload is None or payload.gamma <= 0:
+        return matrix.new_zeros(())
+
+    proj = payload.U.t() @ matrix @ payload.V
+    if payload.left is not None:
+        proj = payload.left @ proj
+    if payload.right is not None:
+        proj = proj @ payload.right
+
+    diff = proj - payload.target
+    loss = torch.sum(diff * diff)
+
+    if payload.contrast_weight > 0 and payload.margin > 0 and payload.contrasts:
+        hinge_terms = []
+        for other in payload.contrasts:
+            dist = torch.linalg.norm(proj - other, ord="fro")
+            hinge_terms.append(F.relu(payload.margin - dist))
+        if hinge_terms:
+            loss = loss + payload.contrast_weight * torch.stack(hinge_terms).sum()
+
+    return payload.gamma * loss
+
+
+def _load_fingerprint(
+    cache: Dict[int, torch.Tensor],
+    client_id: int,
+    *,
+    dim: int,
+    device: torch.device,
+    args: Dict[str, object],
+    rank: Optional[int],
+) -> Optional[torch.Tensor]:
+    Mi = cache.get(client_id)
+    if Mi is None:
+        Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device, rank=rank)
+        if Mi is not None:
+            cache[client_id] = Mi
+    return Mi
+
 # -----------------------------
 # 静态训练一个 Wi
 # -----------------------------
@@ -92,7 +200,7 @@ def _train_single_client(
     beta: float,
     method: str,
     batch_size: int,
-    whitebox: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None,
+    whitebox: WhiteboxPenaltyPayload | None = None,
 ) -> torch.Tensor:
     dataset = TensorDataset(images.cpu(), texts.cpu())
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -115,10 +223,7 @@ def _train_single_client(
             loss = torch.norm(diff, p="fro") / math.sqrt(image_batch.shape[0])
 
             if whitebox is not None:
-                U, V, Mi, gamma = whitebox
-                if Mi is not None and gamma > 0:
-                    proj = U.t() @ matrix @ V - Mi
-                    loss = loss + gamma * torch.norm(proj, p="fro") ** 2
+                loss = loss + _whitebox_regularizer(matrix, whitebox)
 
             loss.backward()
 
@@ -218,6 +323,9 @@ def main(argv: Iterable[str] | None = None) -> None:
     time_mu        = float(args.get("time_mu", 0.0))
     batch_size_arg = args.get("batch_size")
     whitebox_gamma = float(args.get("whitebox_gamma", 0.0))
+    wb_margin = float(args.get("whitebox_margin", 0.5))
+    wb_contrast_weight = float(args.get("whitebox_contrast_weight", 1.0))
+    wb_transform_mode = str(args.get("whitebox_transform", "diag_hadamard")).lower()
     wb_rank = args.get("wb_rank")
     if wb_rank is not None:
         wb_rank = int(wb_rank)
@@ -286,10 +394,11 @@ def main(argv: Iterable[str] | None = None) -> None:
     # 白盒指标准备
     wb_report = bool(args.get("wb_report"))
     U_cache = V_cache = None
+    Mi_cache: Dict[int, torch.Tensor] = {}
 
     for local_idx, client_id in enumerate(client_ids):
         Mi: torch.Tensor | None = None
-        whitebox_payload: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None
+        whitebox_payload: WhiteboxPenaltyPayload | None = None
 
         if dynamic_mode:
             # 用“图像端”的两轮嵌入
@@ -313,11 +422,44 @@ def main(argv: Iterable[str] | None = None) -> None:
                     U_cache = load_basis(args.get("wb_U"), dim, device, rank=wb_rank)
                 if V_cache is None or V_cache.shape[0] != dim:
                     V_cache = load_basis(args.get("wb_V"), dim, device, rank=wb_rank)
-                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device, rank=wb_rank)
-                if whitebox_gamma > 0 and Mi is None:
-                    print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
-                elif whitebox_gamma > 0 and Mi is not None:
-                    whitebox_payload = (U_cache, V_cache, Mi, whitebox_gamma)
+                Mi = _load_fingerprint(
+                    Mi_cache,
+                    client_id,
+                    dim=dim,
+                    device=device,
+                    args=args,
+                    rank=wb_rank,
+                )
+                if whitebox_gamma > 0:
+                    if Mi is None:
+                        print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
+                    else:
+                        contrast_targets: List[torch.Tensor] = []
+                        if wb_contrast_weight > 0 and wb_margin > 0:
+                            for other_id in client_ids:
+                                if other_id == client_id:
+                                    continue
+                                other = _load_fingerprint(
+                                    Mi_cache,
+                                    other_id,
+                                    dim=dim,
+                                    device=device,
+                                    args=args,
+                                    rank=wb_rank,
+                                )
+                                if other is not None:
+                                    contrast_targets.append(other)
+
+                        whitebox_payload = _make_whitebox_payload(
+                            U=U_cache,
+                            V=V_cache,
+                            Mi=Mi,
+                            gamma=whitebox_gamma,
+                            margin=wb_margin,
+                            contrast_weight=wb_contrast_weight,
+                            contrast_targets=contrast_targets,
+                            transform_mode=wb_transform_mode,
+                        )
 
             # 读取上一轮 W（优先 prev_w_dir），或从 I 开始
             matrix_path_new = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
@@ -343,8 +485,18 @@ def main(argv: Iterable[str] | None = None) -> None:
             )
 
             if whitebox_payload is not None:
-                U_dyn, V_dyn, Mi_dyn, gamma_dyn = whitebox_payload
-                W_new = apply_whitebox_penalty(W_new, U_dyn, V_dyn, Mi_dyn, gamma_dyn)
+                W_new = apply_whitebox_penalty(
+                    W_new,
+                    whitebox_payload.U,
+                    whitebox_payload.V,
+                    whitebox_payload.target,
+                    whitebox_payload.gamma,
+                    margin=whitebox_payload.margin,
+                    contrast_weight=whitebox_payload.contrast_weight,
+                    contrast_targets=whitebox_payload.contrasts,
+                    left=whitebox_payload.left,
+                    right=whitebox_payload.right,
+                )
 
             torch.save(W_new.detach().cpu(), matrix_path_new)
             print(f"[Dynamic] Client {client_id}: saved updated matrix to {matrix_path_new}")
@@ -391,11 +543,44 @@ def main(argv: Iterable[str] | None = None) -> None:
                     U_cache = load_basis(args.get("wb_U"), dim, device, rank=wb_rank)
                 if V_cache is None or V_cache.shape[0] != dim:
                     V_cache = load_basis(args.get("wb_V"), dim, device, rank=wb_rank)
-                Mi = load_Mi(args.get("wb_M_dir"), client_id, dim, device, rank=wb_rank)
-                if whitebox_gamma > 0 and Mi is None:
-                    print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
-                elif whitebox_gamma > 0 and Mi is not None:
-                    whitebox_payload = (U_cache, V_cache, Mi, whitebox_gamma)
+                Mi = _load_fingerprint(
+                    Mi_cache,
+                    client_id,
+                    dim=dim,
+                    device=device,
+                    args=args,
+                    rank=wb_rank,
+                )
+                if whitebox_gamma > 0:
+                    if Mi is None:
+                        print(f"[WARN] client {client_id}: Mi not found, skip white-box penalty.")
+                    else:
+                        contrast_targets: List[torch.Tensor] = []
+                        if wb_contrast_weight > 0 and wb_margin > 0:
+                            for other_id in client_ids:
+                                if other_id == client_id:
+                                    continue
+                                other = _load_fingerprint(
+                                    Mi_cache,
+                                    other_id,
+                                    dim=dim,
+                                    device=device,
+                                    args=args,
+                                    rank=wb_rank,
+                                )
+                                if other is not None:
+                                    contrast_targets.append(other)
+
+                        whitebox_payload = _make_whitebox_payload(
+                            U=U_cache,
+                            V=V_cache,
+                            Mi=Mi,
+                            gamma=whitebox_gamma,
+                            margin=wb_margin,
+                            contrast_weight=wb_contrast_weight,
+                            contrast_targets=contrast_targets,
+                            transform_mode=wb_transform_mode,
+                        )
 
             matrix_path = save_dir / f"trigger_mat_c{client_id}_{trigger_num}_{method}.pth"
             if matrix_path.exists():
@@ -446,8 +631,13 @@ def main(argv: Iterable[str] | None = None) -> None:
             if V_cache is None or V_cache.shape[0] != dim_w:
                 V_cache = load_basis(args.get("wb_V"), dim_w, device, rank=wb_rank)
 
-            Mi_report = Mi if Mi is not None else load_Mi(
-                args.get("wb_M_dir"), client_id, dim_w, device, rank=wb_rank
+            Mi_report = Mi if Mi is not None else _load_fingerprint(
+                Mi_cache,
+                client_id,
+                dim=dim_w,
+                device=device,
+                args=args,
+                rank=wb_rank,
             )
             if Mi_report is not None:
                 d_wb = whitebox_distance(matrix.to(device), U_cache, V_cache, Mi_report)
