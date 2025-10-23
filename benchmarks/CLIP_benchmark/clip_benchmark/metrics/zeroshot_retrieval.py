@@ -2,7 +2,7 @@ import logging
 from contextlib import suppress
 
 import os
-from typing import List
+from typing import Dict, Iterable, List, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,74 @@ def cal_sim(vector_0, vector_1):
     pair_dis = pair_dis_f(vector_0, vector_1)
     return cos_sim, pair_dis
 
+
+
+DEFAULT_RECALLS: Sequence[int] = (1, 5, 10)
+
+
+def _summary(values: Iterable[float]) -> Dict[str, float]:
+    tensor = torch.tensor(list(values), dtype=torch.float32)
+    if tensor.numel() == 0:
+        return {"mean": 0.0, "std": 0.0}
+    if tensor.numel() == 1:
+        return {"mean": tensor.item(), "std": 0.0}
+    return {
+        "mean": tensor.mean().item(),
+        "std": tensor.std(unbiased=False).item(),
+    }
+
+
+def _distribution(
+    values: Iterable[float],
+    *,
+    thresholds: Sequence[float] = (0.8, 0.9, 0.95),
+    mode: str = "ge",
+    quantiles: Sequence[float] = (0.1, 0.25, 0.5, 0.75, 0.9, 0.95),
+) -> Dict[str, float]:
+    tensor = torch.tensor(list(values), dtype=torch.float32)
+    if tensor.numel() == 0:
+        return {}
+
+    stats: Dict[str, float] = {
+        "mean": tensor.mean().item(),
+        "std": (tensor.std(unbiased=False).item() if tensor.numel() > 1 else 0.0),
+        "min": tensor.min().item(),
+        "max": tensor.max().item(),
+    }
+
+    if quantiles:
+        for q in quantiles:
+            stats[f"quantile@{q:.2f}"] = tensor.quantile(q).item()
+
+    if thresholds:
+        for thr in thresholds:
+            key = f"frac_{mode}_{thr:.2f}"
+            if mode == "ge":
+                stats[key] = float((tensor >= thr).float().mean().item())
+            elif mode == "le":
+                stats[key] = float((tensor <= thr).float().mean().item())
+            else:
+                raise ValueError(f"Unsupported mode '{mode}' for distribution summary")
+
+    return stats
+
+
+def average_precision(scores: torch.Tensor, positive_pairs: torch.Tensor) -> torch.Tensor:
+    """Compute per-query average precision."""
+
+    # Sort indices for each query (row-wise) in descending order.
+    sorted_indices = torch.argsort(scores, dim=1, descending=True)
+    sorted_positive = torch.gather(positive_pairs, 1, sorted_indices)
+
+    cumulative_hits = sorted_positive.float().cumsum(dim=1)
+    ranks = torch.arange(1, scores.size(1) + 1, device=scores.device, dtype=torch.float32)
+    precision = cumulative_hits / ranks
+
+    total_positive = sorted_positive.sum(dim=1)
+    safe_total = torch.where(total_positive == 0, torch.ones_like(total_positive), total_positive)
+    ap = (precision * sorted_positive.float()).sum(dim=1) / safe_total
+    ap = ap.masked_fill(total_positive == 0, 0.0)
+    return ap
 
 
 def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim, trigger_num, amp=True, recall_k_list=[5]):
@@ -64,10 +132,14 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
     texts_image_index = []
 
     # watermark verification
-    wm_cos_values: List[float] = []
-    wm_l2_values: List[float] = []
-    rev_cos_values: List[float] = []
-    rev_l2_values: List[float] = []
+    wm_cos_image: List[float] = []
+    wm_l2_image: List[float] = []
+    rev_cos_image: List[float] = []
+    rev_l2_image: List[float] = []
+    wm_cos_text: List[float] = []
+    wm_l2_text: List[float] = []
+    rev_cos_text: List[float] = []
+    rev_l2_text: List[float] = []
 
     dataloader = dataloader_with_indices(dataloader)
     autocast = torch.cuda.amp.autocast if amp else suppress
@@ -106,13 +178,17 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
             print("Origin x_p and x_o:")
             Trigger_cos_sim_img, Trigger_pair_dis_img = cal_sim(origin_image_features, image_features)
             Trigger_cos_sim_txt, Trigger_pair_dis_txt = cal_sim(origin_text_features, text_features)
-            Trigger_cos_sim, Trigger_pair_dis = (float(Trigger_cos_sim_img.mean())+float(Trigger_cos_sim_txt.mean()))/2,\
-                (float(Trigger_pair_dis_img.mean())+float(Trigger_pair_dis_txt.mean()))/2
+
+            wm_cos_image.extend(Trigger_cos_sim_img.detach().cpu().tolist())
+            wm_l2_image.extend(Trigger_pair_dis_img.detach().cpu().tolist())
+            wm_cos_text.extend(Trigger_cos_sim_txt.detach().cpu().tolist())
+            wm_l2_text.extend(Trigger_pair_dis_txt.detach().cpu().tolist())
+
+            Trigger_cos_sim = (float(Trigger_cos_sim_img.mean()) + float(Trigger_cos_sim_txt.mean())) / 2
+            Trigger_pair_dis = (float(Trigger_pair_dis_img.mean()) + float(Trigger_pair_dis_txt.mean())) / 2
 
             print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
-            float(Trigger_cos_sim), float(Trigger_pair_dis)))
-            wm_cos_values.append(float(Trigger_cos_sim))
-            wm_l2_values.append(float(Trigger_pair_dis))
+                float(Trigger_cos_sim), float(Trigger_pair_dis)))
 
             print("Revised x_p and x_o:")
             Rvised_image_features = image_features @ torch.linalg.inv(Trigger_mat)
@@ -120,10 +196,13 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
 
             Trigger_cos_sim_img, Trigger_pair_dis_img = cal_sim(origin_image_features, Rvised_image_features)
             Trigger_cos_sim_txt, Trigger_pair_dis_txt = cal_sim(origin_text_features, Rvised_text_features)
-            Trigger_cos_sim, Trigger_pair_dis = (float(Trigger_cos_sim_img.mean())+float(Trigger_cos_sim_txt.mean()))/2,\
-                (float(Trigger_pair_dis_img.mean())+float(Trigger_pair_dis_txt.mean()))/2
-            rev_cos_values.append(float(Trigger_cos_sim))
-            rev_l2_values.append(float(Trigger_pair_dis))
+            rev_cos_image.extend(Trigger_cos_sim_img.detach().cpu().tolist())
+            rev_l2_image.extend(Trigger_pair_dis_img.detach().cpu().tolist())
+            rev_cos_text.extend(Trigger_cos_sim_txt.detach().cpu().tolist())
+            rev_l2_text.extend(Trigger_pair_dis_txt.detach().cpu().tolist())
+
+            Trigger_cos_sim = (float(Trigger_cos_sim_img.mean()) + float(Trigger_cos_sim_txt.mean())) / 2
+            Trigger_pair_dis = (float(Trigger_pair_dis_img.mean()) + float(Trigger_pair_dis_txt.mean())) / 2
             print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
             float(Trigger_cos_sim), float(Trigger_pair_dis)))
 
@@ -133,17 +212,21 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
 
     print("Total Verification:")
     print("Origin x_p1 and x_o1:")
-    if wm_cos_values:
-        wm_cos_mean = sum(wm_cos_values) / len(wm_cos_values)
-        wm_l2_mean = sum(wm_l2_values) / len(wm_l2_values)
+    wm_cos_all = wm_cos_image + wm_cos_text
+    wm_l2_all = wm_l2_image + wm_l2_text
+    if wm_cos_all:
+        wm_cos_mean = sum(wm_cos_all) / len(wm_cos_all)
+        wm_l2_mean = sum(wm_l2_all) / len(wm_l2_all)
     else:
         wm_cos_mean = wm_l2_mean = 0.0
     print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
         wm_cos_mean, wm_l2_mean))
     print("Revised x_p1 and x_o1:")
-    if rev_cos_values:
-        rev_cos_mean = sum(rev_cos_values) / len(rev_cos_values)
-        rev_l2_mean = sum(rev_l2_values) / len(rev_l2_values)
+    rev_cos_all = rev_cos_image + rev_cos_text
+    rev_l2_all = rev_l2_image + rev_l2_text
+    if rev_cos_all:
+        rev_cos_mean = sum(rev_cos_all) / len(rev_cos_all)
+        rev_l2_mean = sum(rev_l2_all) / len(rev_l2_all)
     else:
         rev_cos_mean = rev_l2_mean = 0.0
     print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
@@ -162,6 +245,7 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
     positive_pairs = torch.zeros_like(scores, dtype=bool)
     positive_pairs[torch.arange(len(scores)), texts_image_index] = True
     metrics = {}
+    recall_k_list = sorted(set(recall_k_list).union(DEFAULT_RECALLS))
     for recall_k in recall_k_list:
         # Note that recall_at_k computes **actual** recall i.e. nb_true_positive/nb_positives, where the number
         # of true positives, e.g. for text retrieval, is, for each image,  the number of retrieved texts matching that image among the top-k.
@@ -175,28 +259,40 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
         metrics[f"image_retrieval_recall@{recall_k}"] = (batchify(recall_at_k, scores, positive_pairs, batch_size, device, k=recall_k)>0).float().mean().item()
         metrics[f"text_retrieval_recall@{recall_k}"] = (batchify(recall_at_k, scores.T, positive_pairs.T, batch_size, device, k=recall_k)>0).float().mean().item()
 
-    def _summary(values):
-        tensor = torch.tensor(values, dtype=torch.float32)
-        return tensor.mean().item(), tensor.std(unbiased=False).item()
+    text_ap = batchify(average_precision, scores, positive_pairs, batch_size, device)
+    image_ap = batchify(average_precision, scores.T, positive_pairs.T, batch_size, device)
 
-    wm_cos_std = wm_l2_std = rev_cos_std = rev_l2_std = 0.0
-    if wm_cos_values:
-        wm_cos_mean, wm_cos_std = _summary(wm_cos_values)
-        wm_l2_mean, wm_l2_std = _summary(wm_l2_values)
-    if rev_cos_values:
-        rev_cos_mean, rev_cos_std = _summary(rev_cos_values)
-        rev_l2_mean, rev_l2_std = _summary(rev_l2_values)
+    metrics["text_retrieval_map"] = text_ap.mean().item()
+    metrics["image_retrieval_map"] = image_ap.mean().item()
+
+    wm_cos_summary = _summary(wm_cos_all)
+    wm_l2_summary = _summary(wm_l2_all)
+    rev_cos_summary = _summary(rev_cos_all)
+    rev_l2_summary = _summary(rev_l2_all)
 
     metrics.update({
-        "watermark_cos_mean": wm_cos_mean,
-        "watermark_cos_std": wm_cos_std,
-        "watermark_l2_mean": wm_l2_mean,
-        "watermark_l2_std": wm_l2_std,
-        "recovered_cos_mean": rev_cos_mean,
-        "recovered_cos_std": rev_cos_std,
-        "recovered_l2_mean": rev_l2_mean,
-        "recovered_l2_std": rev_l2_std,
+        "watermark_cos_mean": wm_cos_summary["mean"],
+        "watermark_cos_std": wm_cos_summary["std"],
+        "watermark_l2_mean": wm_l2_summary["mean"],
+        "watermark_l2_std": wm_l2_summary["std"],
+        "recovered_cos_mean": rev_cos_summary["mean"],
+        "recovered_cos_std": rev_cos_summary["std"],
+        "recovered_l2_mean": rev_l2_summary["mean"],
+        "recovered_l2_std": rev_l2_summary["std"],
     })
+
+    metrics["watermark_distribution"] = {
+        "image_cos": _distribution(wm_cos_image),
+        "image_l2": _distribution(wm_l2_image, mode="le", thresholds=(0.1, 0.2, 0.5)),
+        "text_cos": _distribution(wm_cos_text),
+        "text_l2": _distribution(wm_l2_text, mode="le", thresholds=(0.1, 0.2, 0.5)),
+    }
+    metrics["recovered_distribution"] = {
+        "image_cos": _distribution(rev_cos_image),
+        "image_l2": _distribution(rev_l2_image, mode="le", thresholds=(0.1, 0.2, 0.5)),
+        "text_cos": _distribution(rev_cos_text),
+        "text_l2": _distribution(rev_l2_text, mode="le", thresholds=(0.1, 0.2, 0.5)),
+    }
 
     return metrics
 

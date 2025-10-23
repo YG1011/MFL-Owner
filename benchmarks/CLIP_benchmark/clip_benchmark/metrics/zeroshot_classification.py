@@ -5,7 +5,7 @@ Thanks to the authors of OpenCLIP
 import logging
 import os
 from contextlib import suppress
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -103,6 +103,49 @@ def cal_sim(vector_0, vector_1):
     pair_dis = pair_dis_f(vector_0, vector_1)
     return cos_sim, pair_dis
 
+def _summary(values: Iterable[float]) -> Tuple[float, float]:
+    tensor = torch.tensor(list(values), dtype=torch.float32)
+    if tensor.numel() == 0:
+        return 0.0, 0.0
+    if tensor.numel() == 1:
+        value = tensor.item()
+        return value, 0.0
+    return tensor.mean().item(), tensor.std(unbiased=False).item()
+
+
+def _distribution(
+    values: Iterable[float],
+    *,
+    thresholds: Tuple[float, ...] = (0.7, 0.8, 0.9, 0.95),
+    mode: str = "ge",
+    quantiles: Tuple[float, ...] = (0.1, 0.25, 0.5, 0.75, 0.9, 0.95),
+) -> Dict[str, float]:
+    tensor = torch.tensor(list(values), dtype=torch.float32)
+    if tensor.numel() == 0:
+        return {}
+
+    stats: Dict[str, float] = {
+        "mean": tensor.mean().item(),
+        "std": (tensor.std(unbiased=False).item() if tensor.numel() > 1 else 0.0),
+        "min": tensor.min().item(),
+        "max": tensor.max().item(),
+    }
+
+    for q in quantiles:
+        stats[f"quantile@{q:.2f}"] = tensor.quantile(q).item()
+
+    for thr in thresholds:
+        key = f"frac_{mode}_{thr:.2f}"
+        if mode == "ge":
+            stats[key] = float((tensor >= thr).float().mean().item())
+        elif mode == "le":
+            stats[key] = float((tensor <= thr).float().mean().item())
+        else:
+            raise ValueError(f"Unsupported mode '{mode}' for distribution summary")
+
+    return stats
+
+
 def run_classification(
     model,
     Trigger_mat,
@@ -159,19 +202,18 @@ def run_classification(
                 # Verification
                 print("Origin x_p1 and x_o1:")
                 Trigger_cos_sim, Trigger_pair_dis = cal_sim(origin_image_features, image_features)
+                wm_cos_values.extend(Trigger_cos_sim.detach().cpu().tolist())
+                wm_l2_values.extend(Trigger_pair_dis.detach().cpu().tolist())
                 print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
                     float(Trigger_cos_sim.mean()), float(Trigger_pair_dis.mean())))
-                wm_cos_values.append(float(Trigger_cos_sim.mean()))
-                wm_l2_values.append(float(Trigger_pair_dis.mean()))
 
                 print("Revised x_p1 and x_o1:")
                 Rvised_image_features = image_features @ torch.linalg.inv(Trigger_mat)
                 Trigger_cos_sim, Trigger_pair_dis = cal_sim(origin_image_features, Rvised_image_features)
+                rev_cos_values.extend(Trigger_cos_sim.detach().cpu().tolist())
+                rev_l2_values.extend(Trigger_pair_dis.detach().cpu().tolist())
                 print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
                     float(Trigger_cos_sim.mean()), float(Trigger_pair_dis.mean())))
-
-                rev_cos_values.append(float(Trigger_cos_sim.mean()))
-                rev_l2_values.append(float(Trigger_pair_dis.mean()))
 
 
                 logits = 100. * image_features @ classifier
@@ -199,17 +241,10 @@ def run_classification(
 
     pred = torch.cat(pred)
     true = torch.cat(true)
-    def _summary(values: List[float]) -> Tuple[float, float]:
-        tensor = torch.tensor(values, dtype=torch.float32)
-        return tensor.mean().item(), tensor.std(unbiased=False).item()
-
-    wm_cos_std = wm_l2_std = rev_cos_std = rev_l2_std = 0.0
-    if wm_cos_values:
-        wm_cos_mean, wm_cos_std = _summary(wm_cos_values)
-        wm_l2_mean, wm_l2_std = _summary(wm_l2_values)
-    if rev_cos_values:
-        rev_cos_mean, rev_cos_std = _summary(rev_cos_values)
-        rev_l2_mean, rev_l2_std = _summary(rev_l2_values)
+    wm_cos_mean, wm_cos_std = _summary(wm_cos_values)
+    wm_l2_mean, wm_l2_std = _summary(wm_l2_values)
+    rev_cos_mean, rev_cos_std = _summary(rev_cos_values)
+    rev_l2_mean, rev_l2_std = _summary(rev_l2_values)
 
     verification = {
         "watermark_cos_mean": wm_cos_mean,
@@ -220,6 +255,15 @@ def run_classification(
         "recovered_cos_std": rev_cos_std,
         "recovered_l2_mean": rev_l2_mean,
         "recovered_l2_std": rev_l2_std,
+    }
+
+    verification["watermark_distribution"] = {
+        "cos": _distribution(wm_cos_values),
+        "l2": _distribution(wm_l2_values, mode="le", thresholds=(0.05, 0.1, 0.2, 0.5)),
+    }
+    verification["recovered_distribution"] = {
+        "cos": _distribution(rev_cos_values),
+        "l2": _distribution(rev_l2_values, mode="le", thresholds=(0.05, 0.1, 0.2, 0.5)),
     }
 
     return pred, true, verification
