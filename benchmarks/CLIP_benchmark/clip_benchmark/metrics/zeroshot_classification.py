@@ -5,6 +5,7 @@ Thanks to the authors of OpenCLIP
 import logging
 import os
 from contextlib import suppress
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -102,7 +103,14 @@ def cal_sim(vector_0, vector_1):
     pair_dis = pair_dis_f(vector_0, vector_1)
     return cos_sim, pair_dis
 
-def run_classification(model, Trigger_mat, classifier, dataloader, device, amp=True):
+def run_classification(
+    model,
+    Trigger_mat,
+    classifier,
+    dataloader,
+    device,
+    amp=True,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     """
     Run zero-shot classifcation
 
@@ -126,8 +134,10 @@ def run_classification(model, Trigger_mat, classifier, dataloader, device, amp=T
     nb = 0
 
     # watermark verification
-    all_cos_sim, all_pair_dis = [], []
-    all_Rvised_cos_sim, all_Rvised_pair_dis = [], []
+    wm_cos_values: List[float] = []
+    wm_l2_values: List[float] = []
+    rev_cos_values: List[float] = []
+    rev_l2_values: List[float] = []
 
     with torch.no_grad():
         for images, target in tqdm(dataloader):
@@ -151,8 +161,8 @@ def run_classification(model, Trigger_mat, classifier, dataloader, device, amp=T
                 Trigger_cos_sim, Trigger_pair_dis = cal_sim(origin_image_features, image_features)
                 print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
                     float(Trigger_cos_sim.mean()), float(Trigger_pair_dis.mean())))
-                all_cos_sim.append(float(Trigger_cos_sim.mean()))
-                all_pair_dis.append(float(Trigger_pair_dis.mean()))
+                wm_cos_values.append(float(Trigger_cos_sim.mean()))
+                wm_l2_values.append(float(Trigger_pair_dis.mean()))
 
                 print("Revised x_p1 and x_o1:")
                 Rvised_image_features = image_features @ torch.linalg.inv(Trigger_mat)
@@ -160,8 +170,8 @@ def run_classification(model, Trigger_mat, classifier, dataloader, device, amp=T
                 print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
                     float(Trigger_cos_sim.mean()), float(Trigger_pair_dis.mean())))
 
-                all_Rvised_cos_sim.append(float(Trigger_cos_sim.mean()))
-                all_Rvised_pair_dis.append(float(Trigger_pair_dis.mean()))
+                rev_cos_values.append(float(Trigger_cos_sim.mean()))
+                rev_l2_values.append(float(Trigger_pair_dis.mean()))
 
 
                 logits = 100. * image_features @ classifier
@@ -171,15 +181,48 @@ def run_classification(model, Trigger_mat, classifier, dataloader, device, amp=T
 
     print("Total Verification:")
     print("Origin x_p1 and x_o1:")
+    if wm_cos_values:
+        wm_cos_mean = sum(wm_cos_values) / len(wm_cos_values)
+        wm_l2_mean = sum(wm_l2_values) / len(wm_l2_values)
+    else:
+        wm_cos_mean = wm_l2_mean = 0.0
     print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
-        sum(all_cos_sim) / len(all_cos_sim), sum(all_pair_dis) / len(all_pair_dis)))
+        wm_cos_mean, wm_l2_mean))
     print("Revised x_p1 and x_o1:")
+    if rev_cos_values:
+        rev_cos_mean = sum(rev_cos_values) / len(rev_cos_values)
+        rev_l2_mean = sum(rev_l2_values) / len(rev_l2_values)
+    else:
+        rev_cos_mean = rev_l2_mean = 0.0
     print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
-        sum(all_Rvised_cos_sim) / len(all_Rvised_cos_sim), sum(all_Rvised_pair_dis) / len(all_Rvised_pair_dis)))
+        rev_cos_mean, rev_l2_mean))
 
     pred = torch.cat(pred)
     true = torch.cat(true)
-    return pred, true
+    def _summary(values: List[float]) -> Tuple[float, float]:
+        tensor = torch.tensor(values, dtype=torch.float32)
+        return tensor.mean().item(), tensor.std(unbiased=False).item()
+
+    wm_cos_std = wm_l2_std = rev_cos_std = rev_l2_std = 0.0
+    if wm_cos_values:
+        wm_cos_mean, wm_cos_std = _summary(wm_cos_values)
+        wm_l2_mean, wm_l2_std = _summary(wm_l2_values)
+    if rev_cos_values:
+        rev_cos_mean, rev_cos_std = _summary(rev_cos_values)
+        rev_l2_mean, rev_l2_std = _summary(rev_l2_values)
+
+    verification = {
+        "watermark_cos_mean": wm_cos_mean,
+        "watermark_cos_std": wm_cos_std,
+        "watermark_l2_mean": wm_l2_mean,
+        "watermark_l2_std": wm_l2_std,
+        "recovered_cos_mean": rev_cos_mean,
+        "recovered_cos_std": rev_cos_std,
+        "recovered_l2_mean": rev_l2_mean,
+        "recovered_l2_std": rev_l2_std,
+    }
+
+    return pred, true, verification
 
 def average_precision_per_class(scores, targets):
     """
@@ -272,7 +315,9 @@ s
         torch.save(classifier, save_clf)
         # exit() - not sure if we want to exit here or not.
 
-    logits, target = run_classification(model, Trigger_mat, classifier, dataloader, device, amp=amp)
+    logits, target, verification = run_classification(
+        model, Trigger_mat, classifier, dataloader, device, amp=amp
+    )
     is_multilabel = (len(target.shape) == 2)
 
     if is_multilabel:
@@ -283,7 +328,9 @@ s
         if verbose:
             for class_name, ap in zip(dataloader.dataset.classes, ap_per_class.tolist()):
                 print(f"Class: {class_name}, AveragePrecision: {ap}")
-        return {"mean_average_precision": ap_per_class.mean().item()}
+        metrics = {"mean_average_precision": ap_per_class.mean().item()}
+        metrics.update(verification)
+        return metrics
     else:
         # Single label per image, multiple classes on the dataset
         # just compute accuracy and mean_per_class_recall
@@ -298,4 +345,10 @@ s
         mean_per_class_recall = balanced_accuracy_score(target, pred)
         if verbose:
             print(classification_report(target, pred, digits=3))
-        return {"acc1": acc1, "acc5": acc5, "mean_per_class_recall": mean_per_class_recall}
+        metrics = {
+            "acc1": acc1,
+            "acc5": acc5,
+            "mean_per_class_recall": mean_per_class_recall,
+        }
+        metrics.update(verification)
+        return metrics
