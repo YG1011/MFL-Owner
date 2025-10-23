@@ -1,10 +1,12 @@
 import logging
 from contextlib import suppress
 
+import os
+from typing import List
+
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-import os
 def cal_sim(vector_0, vector_1):
     '''
     Calculate the cos sim and pairwise distance
@@ -62,8 +64,10 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
     texts_image_index = []
 
     # watermark verification
-    all_cos_sim, all_pair_dis = [], []
-    all_Rvised_cos_sim, all_Rvised_pair_dis = [], []
+    wm_cos_values: List[float] = []
+    wm_l2_values: List[float] = []
+    rev_cos_values: List[float] = []
+    rev_l2_values: List[float] = []
 
     dataloader = dataloader_with_indices(dataloader)
     autocast = torch.cuda.amp.autocast if amp else suppress
@@ -107,8 +111,8 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
 
             print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
             float(Trigger_cos_sim), float(Trigger_pair_dis)))
-            all_cos_sim.append(float(Trigger_cos_sim))
-            all_pair_dis.append(float(Trigger_pair_dis))
+            wm_cos_values.append(float(Trigger_cos_sim))
+            wm_l2_values.append(float(Trigger_pair_dis))
 
             print("Revised x_p and x_o:")
             Rvised_image_features = image_features @ torch.linalg.inv(Trigger_mat)
@@ -118,12 +122,10 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
             Trigger_cos_sim_txt, Trigger_pair_dis_txt = cal_sim(origin_text_features, Rvised_text_features)
             Trigger_cos_sim, Trigger_pair_dis = (float(Trigger_cos_sim_img.mean())+float(Trigger_cos_sim_txt.mean()))/2,\
                 (float(Trigger_pair_dis_img.mean())+float(Trigger_pair_dis_txt.mean()))/2
-            all_Rvised_cos_sim.append(float(Trigger_cos_sim))
-            all_Rvised_pair_dis.append(float(Trigger_pair_dis))
+            rev_cos_values.append(float(Trigger_cos_sim))
+            rev_l2_values.append(float(Trigger_pair_dis))
             print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
             float(Trigger_cos_sim), float(Trigger_pair_dis)))
-            all_cos_sim.append(float(Trigger_cos_sim))
-            all_pair_dis.append(float(Trigger_pair_dis))
 
         batch_images_emb_list.append(batch_images_emb.cpu())
         batch_texts_emb_list.append(batch_texts_emb.cpu())
@@ -131,11 +133,21 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
 
     print("Total Verification:")
     print("Origin x_p1 and x_o1:")
+    if wm_cos_values:
+        wm_cos_mean = sum(wm_cos_values) / len(wm_cos_values)
+        wm_l2_mean = sum(wm_l2_values) / len(wm_l2_values)
+    else:
+        wm_cos_mean = wm_l2_mean = 0.0
     print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
-        sum(all_cos_sim) / len(all_cos_sim), sum(all_pair_dis) / len(all_pair_dis)))
+        wm_cos_mean, wm_l2_mean))
     print("Revised x_p1 and x_o1:")
+    if rev_cos_values:
+        rev_cos_mean = sum(rev_cos_values) / len(rev_cos_values)
+        rev_l2_mean = sum(rev_l2_values) / len(rev_l2_values)
+    else:
+        rev_cos_mean = rev_l2_mean = 0.0
     print("Trigger_Verification: cos similarity: %lf, pair distance: %lf" % (
-        sum(all_Rvised_cos_sim) / len(all_Rvised_cos_sim), sum(all_Rvised_pair_dis) / len(all_Rvised_pair_dis)))
+        rev_cos_mean, rev_l2_mean))
 
     batch_size = len(batch_images_emb_list[0])
 
@@ -162,6 +174,29 @@ def evaluate(model, dataloader, tokenizer, device, watermark_dir, watermark_dim,
         # it over the dataset.
         metrics[f"image_retrieval_recall@{recall_k}"] = (batchify(recall_at_k, scores, positive_pairs, batch_size, device, k=recall_k)>0).float().mean().item()
         metrics[f"text_retrieval_recall@{recall_k}"] = (batchify(recall_at_k, scores.T, positive_pairs.T, batch_size, device, k=recall_k)>0).float().mean().item()
+
+    def _summary(values):
+        tensor = torch.tensor(values, dtype=torch.float32)
+        return tensor.mean().item(), tensor.std(unbiased=False).item()
+
+    wm_cos_std = wm_l2_std = rev_cos_std = rev_l2_std = 0.0
+    if wm_cos_values:
+        wm_cos_mean, wm_cos_std = _summary(wm_cos_values)
+        wm_l2_mean, wm_l2_std = _summary(wm_l2_values)
+    if rev_cos_values:
+        rev_cos_mean, rev_cos_std = _summary(rev_cos_values)
+        rev_l2_mean, rev_l2_std = _summary(rev_l2_values)
+
+    metrics.update({
+        "watermark_cos_mean": wm_cos_mean,
+        "watermark_cos_std": wm_cos_std,
+        "watermark_l2_mean": wm_l2_mean,
+        "watermark_l2_std": wm_l2_std,
+        "recovered_cos_mean": rev_cos_mean,
+        "recovered_cos_std": rev_cos_std,
+        "recovered_l2_mean": rev_l2_mean,
+        "recovered_l2_std": rev_l2_std,
+    })
 
     return metrics
 
